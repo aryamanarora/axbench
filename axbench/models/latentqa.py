@@ -1,9 +1,11 @@
 """
 LatentQA integration for AxBench.
 
-Implements two model classes:
+Implements three model classes:
 - LatentQAReading: Uses LatentQA's reading mode for concept detection (latent inference).
-- LatentQASteering: Uses LatentQA's control mode for steering (steering inference).
+- LatentQASteering: Uses LatentQA's control mode (LoRA) for steering (steering inference).
+- LatentQAGradientSteering: Uses decoder-loss gradients on target activations as
+  steering vectors. Cheaper than LoRA — no per-concept training, just one forward+backward.
 
 Requires the LatentQA repo (https://github.com/aypan17/latentqa) to be installed.
 Install with: pip install -e /path/to/latentqa
@@ -80,6 +82,23 @@ def _get_model_layers_str(model):
         except AttributeError:
             continue
     raise RuntimeError("Cannot find model layers. Unsupported model architecture.")
+
+
+def _load_decoder_model(target_model_name, decoder_model_name, decoder_device):
+    """Load the LatentQA decoder model (shared across model classes)."""
+    _ensure_latentqa_imported()
+    from lit.utils.infra_utils import get_model as lqa_get_model, get_tokenizer as lqa_get_tokenizer
+
+    logger.warning(f"Loading LatentQA decoder from {decoder_model_name} to {decoder_device}")
+    lqa_tokenizer = lqa_get_tokenizer(target_model_name)
+    decoder_model = lqa_get_model(
+        model_name=target_model_name,
+        tokenizer=lqa_tokenizer,
+        load_peft_checkpoint=decoder_model_name,
+        device=decoder_device,
+    )
+    decoder_model.eval()
+    return decoder_model
 
 
 def _get_modules(target_model, decoder_model, min_layer=15, max_layer=16,
@@ -160,20 +179,8 @@ class LatentQAReading(BaseModel):
         if self.decoder_model is not None:
             return  # already loaded
 
-        _ensure_latentqa_imported()
-        from lit.utils.infra_utils import get_model as lqa_get_model, get_tokenizer as lqa_get_tokenizer
-
-        logger.warning(f"Loading LatentQA decoder from {self.decoder_model_name} to {self.decoder_device}")
-
-        # Load the decoder (same architecture as target + LoRA adapter)
-        lqa_tokenizer = lqa_get_tokenizer(self.target_model_name)
-        self.decoder_model = lqa_get_model(
-            model_name=self.target_model_name,
-            tokenizer=lqa_tokenizer,
-            load_peft_checkpoint=self.decoder_model_name,
-            device=self.decoder_device,
-        )
-        self.decoder_model.eval()
+        self.decoder_model = _load_decoder_model(
+            self.target_model_name, self.decoder_model_name, self.decoder_device)
 
         # Set up read/write module hooks
         self.module_read, self.module_write = _get_modules(
@@ -360,18 +367,8 @@ class LatentQASteering(BaseModel):
         """Load the LatentQA decoder model if not already loaded."""
         if self.decoder_model is not None:
             return
-        _ensure_latentqa_imported()
-        from lit.utils.infra_utils import get_model as lqa_get_model, get_tokenizer as lqa_get_tokenizer
-
-        logger.warning(f"Loading LatentQA decoder to {self.decoder_device}")
-        lqa_tokenizer = lqa_get_tokenizer(self.target_model_name)
-        self.decoder_model = lqa_get_model(
-            model_name=self.target_model_name,
-            tokenizer=lqa_tokenizer,
-            load_peft_checkpoint=self.decoder_model_name,
-            device=self.decoder_device,
-        )
-        self.decoder_model.eval()
+        self.decoder_model = _load_decoder_model(
+            self.target_model_name, self.decoder_model_name, self.decoder_device)
 
     def _generate_qa_pairs(self, concept, num_questions=15):
         """Generate QA pairs for a concept using LatentQA reading mode.
@@ -677,4 +674,422 @@ class LatentQASteering(BaseModel):
         self.device = device
         if self.steered_model is not None and self.steered_model is not self.model:
             self.steered_model.to(device)
+        return self
+
+
+class LatentQAGradientSteering(BaseModel):
+    """Gradient-based steering using LatentQA decoder loss.
+
+    Computes d(decoder_loss) / d(target_activations) to get a steering
+    direction, then applies it as an activation addition during generation.
+    Uses the same concept detection prompt as LatentQAReading.
+
+    Much cheaper than LatentQASteering (LoRA):
+    - No per-concept LoRA training
+    - Just one forward+backward through target+decoder per concept
+    - Produces a steering vector that naturally supports factor scaling
+
+    The flow:
+    1. train(): For each concept, run target model on concept-embodying prompts,
+       feed activations to decoder with QA pair confirming concept presence,
+       backprop to get gradient on activations, average → steering vector.
+    2. predict_steer(): Hook into target model layer, add
+       factor * steering_vector to hidden states during generation.
+    """
+
+    def __init__(self, model, tokenizer, layer=15, training_args=None, **kwargs):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.layer = layer
+        self.training_args = training_args
+        self.device = kwargs.get("device", "cuda:0")
+        self.decoder_device = kwargs.get("decoder_device", "cuda:1")
+        self.seed = kwargs.get("seed", 42)
+
+        # LatentQA-specific config
+        self.decoder_model_name = kwargs.get(
+            "decoder_model_name", "aypan17/latentqa_llama-3-8b-instruct")
+        self.target_model_name = kwargs.get(
+            "target_model_name", "meta-llama/Meta-Llama-3-8B-Instruct")
+        self.min_layer_to_read = kwargs.get("min_layer_to_read", 15)
+        self.max_layer_to_read = kwargs.get("max_layer_to_read", 16)
+        self.num_layers_to_read = kwargs.get("num_layers_to_read", 1)
+        self.layer_to_write = kwargs.get("layer_to_write", 0)
+        self.modify_chat_template = kwargs.get("modify_chat_template", True)
+
+        # Number of diverse prompts to average gradient over
+        self.num_gradient_samples = kwargs.get("num_gradient_samples", 16)
+
+        self.decoder_model = None
+        self.steering_vectors = None  # (num_concepts, hidden_dim)
+        self.max_activations = {}
+
+    def __str__(self):
+        return 'LatentQAGradientSteering'
+
+    def make_model(self, **kwargs):
+        pass
+
+    def _load_decoder(self):
+        """Load the LatentQA decoder model if not already loaded."""
+        if self.decoder_model is not None:
+            return
+        self.decoder_model = _load_decoder_model(
+            self.target_model_name, self.decoder_model_name, self.decoder_device)
+
+    def _compute_steering_vector(self, concept):
+        """Compute a steering vector for a concept via decoder-loss gradients.
+
+        For each of several diverse prompts:
+        1. Run target model → get activations at read layer (with grad)
+        2. Feed activations to decoder with QA pair confirming concept presence
+        3. Compute cross-entropy loss on the confirmation answer
+        4. Backprop → gradient on target activations
+        5. Average gradient across prompts and sequence positions
+
+        Returns: steering vector of shape (hidden_dim,)
+        """
+        _ensure_latentqa_imported()
+        from lit.utils.activation_utils import latent_qa
+        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
+
+        tokenize_fn = _get_tokenize_fn()
+        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+
+        module_read, module_write = _get_modules(
+            self.model, self.decoder_model,
+            min_layer=self.min_layer_to_read,
+            max_layer=self.max_layer_to_read,
+            layer_to_write=self.layer_to_write,
+            num_layers_to_read=self.num_layers_to_read,
+        )
+
+        # QA pair: same question as reading mode, answer confirms concept is present
+        question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE.format(concept=concept)
+        answer_text = (
+            f"The concept '{concept}' is strongly and clearly present in this text. "
+            f"Rating: [[2]]"
+        )
+
+        # Diverse prompts to compute gradient over
+        prompts = [
+            f"You must {concept} in all your responses.",
+            f"Please {concept}.",
+            f"The assistant should always {concept}.",
+            f"In this conversation, {concept} is required.",
+            f"Remember to {concept} at all times.",
+            f"Make sure you {concept} in every reply.",
+            f"Your task: {concept}.",
+            f"Instruction: {concept} whenever possible.",
+            f"Always {concept} in your output.",
+            f"The key rule is: {concept}.",
+            f"Act as someone who would {concept}.",
+            f"It is important to {concept}.",
+            f"Follow this rule: {concept}.",
+            f"Ensure that you {concept}.",
+            f"The user requests that you {concept}.",
+            f"Do not forget to {concept}.",
+        ]
+        prompts = prompts[:self.num_gradient_samples]
+
+        all_grads = []
+
+        for prompt_text in prompts:
+            read_prompt = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+                chat_template=chat_template,
+            )
+
+            probe_data = [{
+                "read_prompt": read_prompt,
+                "dialog": BASE_DIALOG + [
+                    {"role": "user", "content": question_text},
+                    {"role": "assistant", "content": answer_text},
+                ],
+            }]
+
+            batch = tokenize_fn(
+                probe_data,
+                self.tokenizer,
+                name=self.target_model_name,
+                generate=False,  # include labels for loss computation
+                mask_type=None,
+                mask_all_but_last=True,
+                modify_chat_template=self.modify_chat_template,
+            )
+
+            # Run with gradients enabled on target activations
+            out = latent_qa(
+                batch,
+                self.model,
+                self.decoder_model,
+                module_read[0],
+                module_write[0],
+                self.tokenizer,
+                shift_position_ids=True,
+                generate=False,
+                cache_target_model_grad=True,  # key: enables gradient on target acts
+                no_grad=False,
+            )
+
+            loss = out.loss if hasattr(out, 'loss') else out["loss"]
+            loss.backward()
+
+            # Collect gradient from the target model's read layer
+            # The activation cache in latent_qa hooks into module_read layers;
+            # we need the gradient on the target model's parameters at that layer.
+            # Since cache_target_model_grad=True, the hooked activations retain grad.
+            # We access it via the model's layer output gradient.
+            target_path = _get_model_layers_str(self.model)
+            read_layer_idx = self.min_layer_to_read
+
+            # Get the gradient from the hook: it's on the cached activation
+            # which was retained. We re-run a forward hook to capture it.
+            grad = self._extract_activation_gradient(
+                self.model, batch, module_read[0], read_layer_idx)
+
+            if grad is not None:
+                # Average over batch and sequence dims → (hidden_dim,)
+                # Negate because we want gradient descent direction (decrease loss)
+                avg_grad = -grad.mean(dim=(0, 1)).detach().cpu()
+                all_grads.append(avg_grad)
+
+            # Clean up gradients
+            self.model.zero_grad()
+            self.decoder_model.zero_grad()
+            torch.cuda.empty_cache()
+
+        if not all_grads:
+            logger.error(f"No gradients collected for concept '{concept}'")
+            hidden_dim = self.model.config.hidden_size
+            return torch.zeros(hidden_dim)
+
+        # Average across all prompt samples
+        steering_vector = torch.stack(all_grads).mean(dim=0)
+        # Normalize to unit length for consistent scaling with factors
+        norm = steering_vector.norm()
+        if norm > 0:
+            steering_vector = steering_vector / norm
+        return steering_vector
+
+    def _extract_activation_gradient(self, model, batch, module_read_list, layer_idx):
+        """Extract gradient on the target model's layer output activation.
+
+        Since latent_qa with cache_target_model_grad=True runs the target model
+        with gradients, we can get the gradient by hooking into the layer output
+        and running a second forward pass, or by directly accessing the layer's
+        output gradient from the backward pass.
+
+        This method re-runs a forward pass with a gradient-capturing hook.
+        """
+        from lit.utils.activation_utils import _forward_cache_outputs, no_op
+
+        tokenized_read = batch["tokenized_read"].to(self.device)
+
+        grad_cache = []
+
+        def grad_hook(module, grad_input, grad_output):
+            if isinstance(grad_output, tuple):
+                grad_cache.append(grad_output[0].detach())
+            else:
+                grad_cache.append(grad_output.detach())
+
+        # Register backward hook on the read layer
+        handles = []
+        for mod in module_read_list:
+            handles.append(mod.register_full_backward_hook(grad_hook))
+
+        # We already did backward() above, but the hook may not have caught it
+        # if it wasn't registered at that time. In that case, we need to
+        # re-run forward+backward with the hook in place.
+        if not grad_cache:
+            # Re-run forward to capture gradient
+            from lit.utils.activation_utils import latent_qa
+            from lit.utils.dataset_utils import BASE_DIALOG
+
+            tokenize_fn = _get_tokenize_fn()
+
+            module_read, module_write = _get_modules(
+                self.model, self.decoder_model,
+                min_layer=self.min_layer_to_read,
+                max_layer=self.max_layer_to_read,
+                layer_to_write=self.layer_to_write,
+                num_layers_to_read=self.num_layers_to_read,
+            )
+
+            out = latent_qa(
+                batch,
+                self.model,
+                self.decoder_model,
+                module_read[0],
+                module_write[0],
+                self.tokenizer,
+                shift_position_ids=True,
+                generate=False,
+                cache_target_model_grad=True,
+                no_grad=False,
+            )
+            loss = out.loss if hasattr(out, 'loss') else out["loss"]
+            loss.backward()
+
+        for h in handles:
+            h.remove()
+
+        if grad_cache:
+            return grad_cache[0]
+        return None
+
+    def train(self, examples, **kwargs):
+        """Compute gradient-based steering vectors for each concept.
+
+        For each concept, computes the gradient of the decoder loss
+        w.r.t. target model activations, averaged over diverse prompts.
+        """
+        self._load_decoder()
+        concept = kwargs.get("concept", "")
+        concept_id = kwargs.get("concept_id", 0)
+
+        logger.warning(f"Computing gradient steering vector for concept: {concept}")
+
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+
+        steering_vector = self._compute_steering_vector(concept)
+        return steering_vector
+
+    def save(self, dump_dir, **kwargs):
+        """Save accumulated steering vectors."""
+        model_name = kwargs.get("model_name", self.__str__())
+        weight_file = os.path.join(str(dump_dir), f"{model_name}_vectors.pt")
+
+        if hasattr(self, '_accumulated_vectors') and self._accumulated_vectors:
+            vectors = torch.stack(self._accumulated_vectors)
+        elif self.steering_vectors is not None:
+            vectors = self.steering_vectors
+        else:
+            return
+
+        # Append to existing file if present
+        if os.path.exists(weight_file):
+            existing = torch.load(weight_file, map_location="cpu")
+            vectors = torch.cat([existing, vectors], dim=0)
+
+        torch.save(vectors, weight_file)
+        logger.warning(f"Saved {vectors.shape[0]} steering vectors to {weight_file}")
+
+    def load(self, dump_dir=None, **kwargs):
+        """Load steering vectors."""
+        model_name = kwargs.get("model_name", self.__str__())
+        mode = kwargs.get("mode", "steering")
+
+        if dump_dir is not None:
+            weight_file = os.path.join(str(dump_dir), f"{model_name}_vectors.pt")
+            if os.path.exists(weight_file):
+                self.steering_vectors = torch.load(
+                    weight_file, map_location="cpu")
+                logger.warning(
+                    f"Loaded {self.steering_vectors.shape[0]} steering vectors from {weight_file}")
+            else:
+                logger.warning(f"No steering vectors found at {weight_file}")
+
+    @torch.no_grad()
+    def predict_steer(self, examples, **kwargs):
+        """Generate steered text by adding scaled steering vectors to activations.
+
+        For each example, hooks into the target model's read layer and adds
+        factor * steering_vector to the hidden states during generation.
+        """
+        self.model.eval()
+        self.tokenizer.padding_side = "left"
+
+        batch_size = kwargs.get("batch_size", 8)
+        eval_output_length = kwargs.get("eval_output_length", 128)
+        temperature = kwargs.get("temperature", 1.0)
+
+        all_generations = []
+        all_strengths = []
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        progress_bar = tqdm(
+            range(0, len(examples), batch_size), position=rank, leave=True)
+
+        # Get the target layer module for hooking
+        target_path = _get_model_layers_str(self.model)
+        def get_layer(model, path, idx):
+            obj = model
+            for attr in path.split("."):
+                obj = getattr(obj, attr)
+            return obj[idx]
+
+        steer_layer = get_layer(self.model, target_path, self.min_layer_to_read)
+
+        for i in range(0, len(examples), batch_size):
+            batch_examples = examples.iloc[i:i + batch_size]
+            input_strings = batch_examples['input'].tolist()
+            factors = torch.tensor(batch_examples['factor'].tolist())
+            concept_ids = batch_examples['concept_id'].tolist()
+
+            # Build per-example steering vectors scaled by factor
+            batch_steer = []
+            for j, (cid, f) in enumerate(zip(concept_ids, factors)):
+                if self.steering_vectors is not None and cid < len(self.steering_vectors):
+                    vec = self.steering_vectors[cid].to(self.device) * f.item()
+                else:
+                    vec = torch.zeros(self.model.config.hidden_size, device=self.device)
+                batch_steer.append(vec)
+            batch_steer = torch.stack(batch_steer)  # (batch, hidden_dim)
+
+            # Register forward hook that adds the steering vector
+            def make_hook(steer_vecs):
+                def hook_fn(module, input, output):
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                    else:
+                        hidden = output
+                    # Add steering vector to all sequence positions
+                    bsz = min(hidden.shape[0], steer_vecs.shape[0])
+                    hidden[:bsz] = hidden[:bsz] + steer_vecs[:bsz].unsqueeze(1)
+                    if isinstance(output, tuple):
+                        return (hidden,) + output[1:]
+                    return hidden
+                return hook_fn
+
+            hook_handle = steer_layer.register_forward_hook(
+                make_hook(batch_steer))
+
+            inputs = self.tokenizer(
+                input_strings, return_tensors="pt", padding=True, truncation=True
+            ).to(self.device)
+
+            generations = self.model.generate(
+                **inputs,
+                max_new_tokens=eval_output_length,
+                do_sample=True,
+                temperature=temperature,
+            )
+
+            hook_handle.remove()
+
+            input_lengths = [len(input_ids) for input_ids in inputs.input_ids]
+            generated_texts = [
+                self.tokenizer.decode(
+                    generation[input_length:], skip_special_tokens=True)
+                for generation, input_length in zip(generations, input_lengths)
+            ]
+            all_generations += generated_texts
+            all_strengths.extend(factors.tolist())
+            progress_bar.update(1)
+
+        return {
+            "steered_generation": all_generations,
+            "strength": all_strengths,
+        }
+
+    def pre_compute_mean_activations(self, dump_dir, **kwargs):
+        return {}
+
+    def to(self, device):
+        self.device = device
         return self
