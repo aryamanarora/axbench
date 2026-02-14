@@ -820,7 +820,22 @@ class LatentQAGradientSteering(BaseModel):
                 modify_chat_template=self.modify_chat_template,
             )
 
-            # Run with gradients enabled on target activations
+            # Register backward hook on the read layer BEFORE forward pass
+            # so it captures the gradient during backward.
+            grad_cache = []
+
+            def grad_hook(module, grad_input, grad_output):
+                if isinstance(grad_output, tuple):
+                    grad_cache.append(grad_output[0].detach())
+                else:
+                    grad_cache.append(grad_output.detach())
+
+            hook_handles = [
+                mod.register_full_backward_hook(grad_hook)
+                for mod in module_read[0]
+            ]
+
+            # Forward: target model → activation cache → decoder with labels
             out = latent_qa(
                 batch,
                 self.model,
@@ -830,33 +845,27 @@ class LatentQAGradientSteering(BaseModel):
                 self.tokenizer,
                 shift_position_ids=True,
                 generate=False,
-                cache_target_model_grad=True,  # key: enables gradient on target acts
+                cache_target_model_grad=True,  # enables gradient on target acts
                 no_grad=False,
             )
 
-            loss = out.loss if hasattr(out, 'loss') else out["loss"]
+            # Backward: gradient flows decoder → cached activations → target layer
+            loss = out.loss
             loss.backward()
 
-            # Collect gradient from the target model's read layer
-            # The activation cache in latent_qa hooks into module_read layers;
-            # we need the gradient on the target model's parameters at that layer.
-            # Since cache_target_model_grad=True, the hooked activations retain grad.
-            # We access it via the model's layer output gradient.
-            target_path = _get_model_layers_str(self.model)
-            read_layer_idx = self.min_layer_to_read
+            # Remove hooks
+            for h in hook_handles:
+                h.remove()
 
-            # Get the gradient from the hook: it's on the cached activation
-            # which was retained. We re-run a forward hook to capture it.
-            grad = self._extract_activation_gradient(
-                self.model, batch, module_read[0], read_layer_idx)
-
-            if grad is not None:
-                # Average over batch and sequence dims → (hidden_dim,)
-                # Negate because we want gradient descent direction (decrease loss)
-                avg_grad = -grad.mean(dim=(0, 1)).detach().cpu()
+            if grad_cache:
+                # grad_cache[0] shape: (batch, seq_len, hidden_dim)
+                # Average over batch and sequence dims, negate for gradient descent
+                avg_grad = -grad_cache[0].mean(dim=(0, 1)).float().cpu()
                 all_grads.append(avg_grad)
+            else:
+                logger.warning(f"No gradient captured for prompt: {prompt_text[:50]}...")
 
-            # Clean up gradients
+            # Clean up
             self.model.zero_grad()
             self.decoder_model.zero_grad()
             torch.cuda.empty_cache()
@@ -873,73 +882,6 @@ class LatentQAGradientSteering(BaseModel):
         if norm > 0:
             steering_vector = steering_vector / norm
         return steering_vector
-
-    def _extract_activation_gradient(self, model, batch, module_read_list, layer_idx):
-        """Extract gradient on the target model's layer output activation.
-
-        Since latent_qa with cache_target_model_grad=True runs the target model
-        with gradients, we can get the gradient by hooking into the layer output
-        and running a second forward pass, or by directly accessing the layer's
-        output gradient from the backward pass.
-
-        This method re-runs a forward pass with a gradient-capturing hook.
-        """
-        from lit.utils.activation_utils import _forward_cache_outputs, no_op
-
-        tokenized_read = batch["tokenized_read"].to(self.device)
-
-        grad_cache = []
-
-        def grad_hook(module, grad_input, grad_output):
-            if isinstance(grad_output, tuple):
-                grad_cache.append(grad_output[0].detach())
-            else:
-                grad_cache.append(grad_output.detach())
-
-        # Register backward hook on the read layer
-        handles = []
-        for mod in module_read_list:
-            handles.append(mod.register_full_backward_hook(grad_hook))
-
-        # We already did backward() above, but the hook may not have caught it
-        # if it wasn't registered at that time. In that case, we need to
-        # re-run forward+backward with the hook in place.
-        if not grad_cache:
-            # Re-run forward to capture gradient
-            from lit.utils.activation_utils import latent_qa
-            from lit.utils.dataset_utils import BASE_DIALOG
-
-            tokenize_fn = _get_tokenize_fn()
-
-            module_read, module_write = _get_modules(
-                self.model, self.decoder_model,
-                min_layer=self.min_layer_to_read,
-                max_layer=self.max_layer_to_read,
-                layer_to_write=self.layer_to_write,
-                num_layers_to_read=self.num_layers_to_read,
-            )
-
-            out = latent_qa(
-                batch,
-                self.model,
-                self.decoder_model,
-                module_read[0],
-                module_write[0],
-                self.tokenizer,
-                shift_position_ids=True,
-                generate=False,
-                cache_target_model_grad=True,
-                no_grad=False,
-            )
-            loss = out.loss if hasattr(out, 'loss') else out["loss"]
-            loss.backward()
-
-        for h in handles:
-            h.remove()
-
-        if grad_cache:
-            return grad_cache[0]
-        return None
 
     def train(self, examples, **kwargs):
         """Compute gradient-based steering vectors for each concept.
