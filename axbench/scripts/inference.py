@@ -39,7 +39,7 @@ STATE_FILE = "inference_state.pkl"
 CONFIG_FILE = "config.json"
 METADATA_FILE = "metadata.jsonl"
 STEERING_WITH_SHARED_MODELS = {"HyperSteer"}
-STEERING_EXCLUDE_MODELS = {"IntegratedGradients", "InputXGradients", "PromptDetection", "BoW", "LatentQAReading"}
+STEERING_EXCLUDE_MODELS = {"IntegratedGradients", "InputXGradients", "PromptDetection", "BoW", "LatentQAReading", "ActivationOracleReading"}
 LATENT_EXCLUDE_MODELS = {"PromptSteering", "PromptBaseline", "DiReFT", "LoReFT", "LoRA", "SFT", "HyperSteer", "LatentQASteering", "LatentQAGradientSteering"}
 LATENT_PROMPT_PREFIX = "Generate a random sentence."
 
@@ -659,7 +659,7 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
                 current_df = cache_df[(concept_id, dataset_category)]
 
             predict_kwargs = dict(batch_size=args.latent_batch_size, prefix_length=prefix_length)
-            if model_name in {"PromptDetection", "LatentQAReading"}:
+            if model_name in {"PromptDetection", "LatentQAReading", "ActivationOracleReading"}:
                 predict_kwargs["concept"] = metadata[concept_id]["concept"]
             results = benchmark_model.predict_latent(
                 current_df, **predict_kwargs
@@ -855,7 +855,7 @@ def infer_latent_imbalance(args, rank, world_size, device, logger, training_args
             low_rank_dimension=len(metadata),
             device=device
         )
-        if model_name in {"PromptDetection", "BoW", "LatentQAReading"}:
+        if model_name in {"PromptDetection", "BoW", "LatentQAReading", "ActivationOracleReading"}:
             for concept_id in concept_ids:
                 benchmark_model.load(
                     dump_dir=train_dir, sae_path=metadata[0]["ref"], mode="latent",
