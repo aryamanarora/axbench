@@ -37,6 +37,13 @@ CONCEPT_DETECTION_QUESTION_TEMPLATE = (
     "Is the assistant thinking about the concept '{concept}'?"
 )
 
+CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING = (
+    "Is the following concept present in the text? Concept: '{concept}'. "
+    "Answer with a rating from 0 to 2, where 0 means the concept is not present at all, "
+    "1 means the concept is somewhat present, and 2 means the concept is strongly present. "
+    "Provide your rating using this exact format: Rating: [[score]]."
+)
+
 
 def _ensure_latentqa_imported():
     """Ensure the LatentQA library is importable."""
@@ -314,6 +321,106 @@ class LatentQAReading(BaseModel):
         # Note: target model device is managed by AxBench infrastructure
         # decoder stays on its own device
         return self
+
+
+class LatentQAReadingRating(LatentQAReading):
+    """LatentQA Reading using 0-2 rating generation instead of Yes/No logits."""
+
+    def __str__(self):
+        return "LatentQAReadingRating"
+
+    @staticmethod
+    def _get_rating_from_completion(completion):
+        """Parse a 0-2 rating from the decoder's free-text completion."""
+        import re
+        try:
+            if "Rating:" in completion:
+                rating_text = completion.split("Rating:")[-1].strip()
+                rating_text = rating_text.split("\n")[0].strip()
+                rating_text = (
+                    rating_text.replace("[", "").replace("]", "")
+                    .strip('"').strip("'").strip("*").strip()
+                )
+                rating = float(rating_text)
+                if 0 <= rating <= 2:
+                    return rating
+            numbers = re.findall(r"\b([012](?:\.\d+)?)\b", completion)
+            if numbers:
+                return float(numbers[-1])
+            return -1
+        except (ValueError, IndexError):
+            return -1
+
+    def predict_latent(self, examples, **kwargs):
+        _ensure_latentqa_imported()
+        from lit.utils.activation_utils import latent_qa
+        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
+
+        tokenize_fn = _get_tokenize_fn()
+
+        self.model.eval()
+        self.decoder_model.eval()
+
+        concept = kwargs.get("concept", "")
+        batch_size = kwargs.get("batch_size", 4)
+
+        question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING.format(concept=concept)
+        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+
+        all_max_act = []
+
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
+        for i in tqdm(range(0, len(examples), batch_size), desc="LatentQA Rating"):
+            batch_examples = examples.iloc[i:i + batch_size]
+
+            probe_data = []
+            for _, row in batch_examples.iterrows():
+                user_text = row.get("input", "")
+                assistant_text = row.get("output", "")
+                read_prompt = self.tokenizer.apply_chat_template(
+                    [
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": assistant_text},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    chat_template=chat_template,
+                )
+                dialog = BASE_DIALOG + [
+                    {"role": "user", "content": question_text},
+                ]
+                probe_data.append({
+                    "read_prompt": read_prompt,
+                    "dialog": dialog,
+                })
+
+            batch_tokenized = tokenize_fn(
+                probe_data, self.tokenizer, name=self.target_model_name,
+                generate=True, mask_type=None, mask_all_but_last=True,
+                modify_chat_template=self.modify_chat_template,
+            )
+
+            with torch.no_grad():
+                out = latent_qa(
+                    batch_tokenized, self.model, self.decoder_model,
+                    self.module_read[0], self.module_write[0], self.tokenizer,
+                    shift_position_ids=False, generate=True,
+                    max_new_tokens=50, no_grad=True,
+                )
+
+            num_tokens = batch_tokenized["tokenized_write"]["input_ids"][0].shape[0]
+            for j in range(len(batch_examples)):
+                completion = self.tokenizer.decode(
+                    out[j][num_tokens:], skip_special_tokens=True)
+                rating = self._get_rating_from_completion(completion)
+                all_max_act.append(rating)
+
+            torch.cuda.empty_cache()
+
+        self.tokenizer.padding_side = orig_padding_side
+        return {"max_act": all_max_act}
 
 
 class LatentQASteering(BaseModel):

@@ -659,7 +659,7 @@ def infer_latent(args, rank, world_size, device, logger, training_args, generate
                 current_df = cache_df[(concept_id, dataset_category)]
 
             predict_kwargs = dict(batch_size=args.latent_batch_size, prefix_length=prefix_length)
-            if model_name in {"PromptDetection", "LatentQAReading", "ActivationOracleReading"}:
+            if model_name in {"PromptDetection", "LatentQAReading", "LatentQAReadingRating", "ActivationOracleReading", "ActivationOracleReadingRating"}:
                 predict_kwargs["concept"] = metadata[concept_id]["concept"]
             results = benchmark_model.predict_latent(
                 current_df, **predict_kwargs

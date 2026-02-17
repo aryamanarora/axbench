@@ -37,12 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ── Prompt template (same scale / format used by LatentQAReading) ────────────
-CONCEPT_DETECTION_QUESTION_TEMPLATE = (
+# ── Prompt templates ─────────────────────────────────────────────────────────
+CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING = (
     "Is the following concept present in the text? Concept: '{concept}'. "
     "Answer with a rating from 0 to 2, where 0 means the concept is not present at all, "
     "1 means the concept is somewhat present, and 2 means the concept is strongly present. "
     "Provide your rating using this exact format: Rating: [[score]]."
+)
+
+CONCEPT_DETECTION_QUESTION_TEMPLATE = (
+    "Is the assistant thinking about the concept '{concept}'?"
 )
 
 # The activation_oracles library marks injection positions with " ?" tokens.
@@ -208,13 +212,20 @@ class ActivationOracleReading(BaseModel):
         self.device = kwargs.get("device", "cuda:0")
         self.seed = kwargs.get("seed", 42)
 
-        # Oracle config
-        self.oracle_lora_path = kwargs.get(
-            "oracle_lora_path",
+        # Oracle config — auto-detect LoRA path from model name if not provided
+        _ORACLE_LORA_MAP = {
+            "meta-llama/Llama-3.1-8B-Instruct": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Llama-3_1-8B-Instruct",
+            "meta-llama/Meta-Llama-3-8B-Instruct": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Llama-3_1-8B-Instruct",
+            "Qwen/Qwen3-8B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
+        }
+        model_name_str = getattr(tokenizer, "name_or_path", "")
+        default_lora = _ORACLE_LORA_MAP.get(
+            model_name_str,
             "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
         )
+        self.oracle_lora_path = kwargs.get("oracle_lora_path", default_lora)
         self.target_model_name = kwargs.get(
-            "target_model_name", "Qwen/Qwen3-8B")
+            "target_model_name", model_name_str or "Qwen/Qwen3-8B")
         self.layer_percent = kwargs.get("layer_percent", 50)
         self.injection_layer = kwargs.get("injection_layer", 1)
         self.steering_coefficient = kwargs.get("steering_coefficient", 1.0)
@@ -286,6 +297,14 @@ class ActivationOracleReading(BaseModel):
         # Pre-compute the token id(s) for the special " ?" token
         self._special_token_id = self.tokenizer.encode(
             SPECIAL_TOKEN, add_special_tokens=False)
+
+        # Pre-compute Yes/No token ids
+        self._yes_token_id = self.tokenizer.encode(
+            "Yes", add_special_tokens=False)[0]
+        self._no_token_id = self.tokenizer.encode(
+            "No", add_special_tokens=False)[0]
+        logger.warning(
+            f"Yes token: {self._yes_token_id}, No token: {self._no_token_id}")
 
     # ── Private helpers ──────────────────────────────────────────────────
 
@@ -437,7 +456,128 @@ class ActivationOracleReading(BaseModel):
                 all_positions.append(positions[:n])
                 all_vectors.append(vecs[:n])
 
-            # ── 4. Generate with steering hook at injection layer ────
+            # ── 4. Forward pass with steering hook at injection layer ──
+            layers = _get_model_layers(self.model)
+            injection_module = layers[self.injection_layer]
+
+            hook_fn = _make_steering_hook(
+                all_vectors, all_positions, self.steering_coefficient)
+            hook_handle = injection_module.register_forward_hook(hook_fn)
+
+            try:
+                outputs = self.model(**oracle_inputs)
+            finally:
+                hook_handle.remove()
+
+            # Switch back to base default (for next iteration's act extraction)
+            self.model.set_adapter("base_default")
+
+            # ── 5. Extract Yes/No logits at last position ─────────
+            logits = outputs.logits  # [batch, seq_len, vocab]
+            attn_mask = oracle_inputs.attention_mask
+            last_pos = attn_mask.sum(dim=1) - 1  # [batch]
+
+            for b in range(logits.shape[0]):
+                last_logits = logits[b, last_pos[b]]
+                yes_logit = last_logits[self._yes_token_id].item()
+                no_logit = last_logits[self._no_token_id].item()
+                score = torch.softmax(
+                    torch.tensor([yes_logit, no_logit]), dim=0)[0].item()
+                all_max_act.append(score)
+
+            torch.cuda.empty_cache()
+
+        return {"max_act": all_max_act}
+
+    def predict_latents(self, examples, **kwargs):
+        return self.predict_latent(examples, **kwargs)
+
+    def pre_compute_mean_activations(self, dump_dir, **kwargs):
+        return {}
+
+    def to(self, device):
+        self.device = device
+        return self
+
+
+class ActivationOracleReadingRating(ActivationOracleReading):
+    """Activation Oracle using 0-2 rating generation instead of Yes/No logits."""
+
+    def __str__(self):
+        return "ActivationOracleReadingRating"
+
+    @torch.no_grad()
+    def predict_latent(self, examples, **kwargs):
+        self.model.eval()
+        concept = kwargs.get("concept", "")
+        batch_size = kwargs.get("batch_size", 4)
+
+        question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING.format(
+            concept=concept)
+
+        all_max_act = []
+
+        for i in tqdm(
+            range(0, len(examples), batch_size),
+            desc="ActivationOracle Rating",
+        ):
+            batch_examples = examples.iloc[i : i + batch_size]
+
+            texts = []
+            for _, row in batch_examples.iterrows():
+                texts.append(row.get("output", row.get("input", "")))
+
+            self.model.disable_adapter_layers()
+
+            target_inputs = self.tokenizer(
+                texts, return_tensors="pt", padding=True, truncation=True,
+            ).to(self.device)
+
+            activations = _collect_activations(
+                self.model, self._extraction_layer,
+                target_inputs.input_ids, target_inputs.attention_mask,
+            )
+
+            self.model.enable_adapter_layers()
+            self.model.set_adapter(self._oracle_adapter_name)
+
+            oracle_prompts = []
+            per_example_vecs = []
+
+            for b in range(len(texts)):
+                if target_inputs.attention_mask is not None:
+                    num_valid = int(target_inputs.attention_mask[b].sum().item())
+                else:
+                    num_valid = target_inputs.input_ids.shape[1]
+
+                act_vecs = activations[b, -num_valid:]
+                per_example_vecs.append(act_vecs)
+
+                prefix = _get_introspection_prefix(
+                    self._extraction_layer, num_valid)
+                user_msg = prefix + question_text
+
+                prompt_str = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": user_msg}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+                oracle_prompts.append(prompt_str)
+
+            oracle_inputs = self.tokenizer(
+                oracle_prompts, return_tensors="pt", padding=True, truncation=True,
+            ).to(self.device)
+
+            all_positions = []
+            all_vectors = []
+
+            for b in range(oracle_inputs.input_ids.shape[0]):
+                positions = self._find_special_token_positions(
+                    oracle_inputs.input_ids[b])
+                vecs = per_example_vecs[b]
+                n = min(len(positions), vecs.shape[0])
+                all_positions.append(positions[:n])
+                all_vectors.append(vecs[:n])
+
             layers = _get_model_layers(self.model)
             injection_module = layers[self.injection_layer]
 
@@ -454,10 +594,8 @@ class ActivationOracleReading(BaseModel):
             finally:
                 hook_handle.remove()
 
-            # Switch back to base default (for next iteration's act extraction)
             self.model.set_adapter("base_default")
 
-            # ── 5. Parse ratings ─────────────────────────────────────
             prompt_len = oracle_inputs.input_ids.shape[1]
             for b in range(outputs.shape[0]):
                 completion_ids = outputs[b, prompt_len:]
@@ -469,13 +607,3 @@ class ActivationOracleReading(BaseModel):
             torch.cuda.empty_cache()
 
         return {"max_act": all_max_act}
-
-    def predict_latents(self, examples, **kwargs):
-        return self.predict_latent(examples, **kwargs)
-
-    def pre_compute_mean_activations(self, dump_dir, **kwargs):
-        return {}
-
-    def to(self, device):
-        self.device = device
-        return self
