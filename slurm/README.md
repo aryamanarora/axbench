@@ -5,7 +5,7 @@ The `pyvene/axbench-concept500` HuggingFace dataset contains pre-generated evalu
 ## Data preparation
 
 ```bash
-python slurm/prepare_data.py \
+python axbench/data/prepare_data.py \
     --dump_dir results/my_experiment \
     --hf_subdir 2b/l20 \
     --layer 20 \

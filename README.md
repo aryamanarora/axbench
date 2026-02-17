@@ -106,7 +106,35 @@ bash axbench/demo/hypersteer_demo.sh
 
 ## Data generation
 
-(If using our pre-generated data, you can skip this.)
+### Using pre-generated HuggingFace data
+
+If you want to skip data generation and use our pre-generated evaluation data directly:
+
+```bash
+uv run python axbench/data/prepare_data.py \
+    --dump_dir results/my_experiment \
+    --hf_subdir 2b/l20 \
+    --layer 20 \
+    --component res
+```
+
+This downloads the `pyvene/axbench-concept500` dataset and creates the directory structure needed for inference. Available `--hf_subdir` options: `2b/l10`, `2b/l20`, `9b/l20`, `9b/l31`.
+
+Then run inference directly:
+
+```bash
+uv run torchrun --nproc_per_node=1 axbench/scripts/inference.py \
+    --config your_config.yaml \
+    --dump_dir results/my_experiment \
+    --overwrite_inference_data_dir results/my_experiment/inference \
+    --mode latent
+```
+
+> **Note**: The script builds `metadata.jsonl` from the parquet's `output_concept` column to ensure concept IDs are aligned. Do not build metadata from the neuronpedia JSON files — the HF dataset uses a specific curated subset of 500 concepts that does not correspond to the first 500 entries of the JSON.
+
+### Generating data from scratch
+
+(If using the pre-generated data above, you can skip this.)
 
 **Generate training data:**
 

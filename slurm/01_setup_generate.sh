@@ -39,10 +39,9 @@ fi
 
 # Download HF dataset and prepare directory structure
 echo "Preparing data from pyvene/axbench-concept500..."
-python slurm/prepare_data.py \
+python axbench/data/prepare_data.py \
     --dump_dir "$DUMP_DIR" \
-    --concept_path "$CONCEPT_JSON" \
-    --layer 15 \
-    --max_concepts 500
+    --hf_subdir 2b/l20 \
+    --layer 15
 
 echo "Setup complete."

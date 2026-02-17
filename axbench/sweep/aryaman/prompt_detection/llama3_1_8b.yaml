@@ -24,7 +24,7 @@ inference:
   model_name: "meta-llama/Llama-3.1-8B-Instruct"
   output_length: 128
   latent_num_of_examples: 36
-  latent_batch_size: 4
+  latent_batch_size: 256
   steering_intervention_type: "addition"
   steering_model_name: "meta-llama/Llama-3.1-8B-Instruct"
   steering_datasets: ["AlpacaEval"]

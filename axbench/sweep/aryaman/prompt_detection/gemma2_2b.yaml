@@ -24,7 +24,7 @@ inference:
   model_name: "google/gemma-2-2b-it"
   output_length: 128
   latent_num_of_examples: 36
-  latent_batch_size: 4
+  latent_batch_size: 256
   steering_intervention_type: "addition"
   steering_model_name: "google/gemma-2-2b-it"
   steering_datasets: ["AlpacaEval"]
