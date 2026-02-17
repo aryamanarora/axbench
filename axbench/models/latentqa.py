@@ -31,13 +31,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Default questions for reading mode (concept detection).
-# These are asked to the LatentQA decoder to probe what's in the activations.
+# Yes/No question template for concept detection.
+# We measure logits for "Yes" vs "No" tokens from the decoder.
 CONCEPT_DETECTION_QUESTION_TEMPLATE = (
-    "Is the following concept present in the text? Concept: '{concept}'. "
-    "Answer with a rating from 0 to 2, where 0 means the concept is not present at all, "
-    "1 means the concept is somewhat present, and 2 means the concept is strongly present. "
-    "Provide your rating using this exact format: Rating: [[score]]."
+    "Is the assistant thinking about the concept '{concept}'?"
 )
 
 
@@ -182,6 +179,14 @@ class LatentQAReading(BaseModel):
         self.decoder_model = _load_decoder_model(
             self.target_model_name, self.decoder_model_name, self.decoder_device)
 
+        # Ensure decoder vocab matches target model (e.g. if PAD token was added)
+        target_vocab_size = self.model.get_input_embeddings().weight.shape[0]
+        decoder_vocab_size = self.decoder_model.get_input_embeddings().weight.shape[0]
+        if target_vocab_size != decoder_vocab_size:
+            logger.warning(
+                f"Resizing decoder embeddings from {decoder_vocab_size} to {target_vocab_size}")
+            self.decoder_model.resize_token_embeddings(target_vocab_size)
+
         # Set up read/write module hooks
         self.module_read, self.module_write = _get_modules(
             self.model, self.decoder_model,
@@ -191,33 +196,13 @@ class LatentQAReading(BaseModel):
             num_layers_to_read=self.num_layers_to_read,
         )
 
-    def _get_rating_from_completion(self, completion):
-        """Parse a 0-2 rating from the decoder's completion."""
-        try:
-            if "Rating:" in completion:
-                rating_text = completion.split("Rating:")[-1].strip()
-                rating_text = rating_text.split('\n')[0].strip()
-                rating_text = rating_text.replace('[', '').replace(']', '').strip('"').strip("'").strip("*").strip()
-                rating = float(rating_text)
-                if 0 <= rating <= 2:
-                    return rating
-            # Try to find any number 0-2 in the response
-            numbers = re.findall(r'\b([012](?:\.\d+)?)\b', completion)
-            if numbers:
-                return float(numbers[-1])
-            logger.warning(f"Cannot find rating in completion: {completion[:200]}")
-            return -1
-        except (ValueError, IndexError) as e:
-            logger.error(f"Error parsing rating: {completion[:200]}. Error: {e}")
-            return -1
-
     @torch.no_grad()
     def predict_latent(self, examples, **kwargs):
         """Use LatentQA reading mode for concept detection.
 
         For each example, extracts activations from the target model,
-        feeds them to the LatentQA decoder with a concept-specific question,
-        and parses the response for a relevance rating.
+        feeds them to the LatentQA decoder with a yes/no concept question,
+        and uses P(Yes) - P(No) logit difference as the detection score.
         """
         _ensure_latentqa_imported()
         from lit.utils.activation_utils import latent_qa
@@ -229,43 +214,47 @@ class LatentQAReading(BaseModel):
         self.decoder_model.eval()
 
         concept = kwargs.get("concept", "")
-        batch_size = kwargs.get("batch_size", 4)  # smaller default due to 2 models in memory
+        batch_size = kwargs.get("batch_size", 4)
 
-        # Build the question for this concept
+        # Get token IDs for "Yes" and "No"
+        yes_token_id = self.tokenizer.encode("Yes", add_special_tokens=False)[0]
+        no_token_id = self.tokenizer.encode("No", add_special_tokens=False)[0]
+
         question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE.format(concept=concept)
-
         chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         all_max_act = []
 
+        # LatentQA requires left padding
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
         for i in tqdm(range(0, len(examples), batch_size), desc="LatentQA Reading"):
             batch_examples = examples.iloc[i:i + batch_size]
 
-            # For each example in the batch, construct LatentQA inputs
             probe_data = []
             for _, row in batch_examples.iterrows():
-                # Use the output text as what we want to read from
-                text = row.get("output", row.get("input", ""))
-
-                # Format as dialog for the target model
+                user_text = row.get("input", "")
+                assistant_text = row.get("output", "")
                 read_prompt = self.tokenizer.apply_chat_template(
-                    [{"role": "user", "content": text}],
+                    [
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": assistant_text},
+                    ],
                     tokenize=False,
-                    add_generation_prompt=True,
+                    add_generation_prompt=False,
                     chat_template=chat_template,
                 )
-
-                # The decoder gets a QA dialog asking about the concept
                 dialog = BASE_DIALOG + [
                     {"role": "user", "content": question_text},
                 ]
-
                 probe_data.append({
                     "read_prompt": read_prompt,
                     "dialog": dialog,
                 })
 
-            # Tokenize for LatentQA
+            # Tokenize with generate=True to include the assistant header,
+            # then do a forward pass to get logits (not model.generate).
             batch_tokenized = tokenize_fn(
                 probe_data,
                 self.tokenizer,
@@ -276,7 +265,11 @@ class LatentQAReading(BaseModel):
                 modify_chat_template=self.modify_chat_template,
             )
 
-            # Run LatentQA: extract activations from target, decode with decoder
+            # Add dummy labels so latent_qa accepts generate=False
+            input_ids = batch_tokenized["tokenized_write"]["input_ids"]
+            batch_tokenized["tokenized_write"]["labels"] = input_ids.clone()
+
+            # Forward pass to get logits
             out = latent_qa(
                 batch_tokenized,
                 self.model,
@@ -285,20 +278,29 @@ class LatentQAReading(BaseModel):
                 self.module_write[0],
                 self.tokenizer,
                 shift_position_ids=False,
-                generate=True,
-                max_new_tokens=self.max_new_tokens,
+                generate=False,
                 no_grad=True,
             )
 
-            # Parse completions
-            for j in range(len(out)):
-                num_tokens = batch_tokenized["tokenized_write"][j].shape[0]
-                completion = self.tokenizer.decode(out[j][num_tokens:], skip_special_tokens=True)
-                rating = self._get_rating_from_completion(completion)
-                all_max_act.append(rating)
+            # Extract logits at the last non-padding position for each example
+            logits = out.logits  # (batch, seq_len, vocab_size)
+            attention_mask = batch_tokenized["tokenized_write"]["attention_mask"].to(logits.device)
+            # Last real token position per example
+            last_pos = attention_mask.sum(dim=1) - 1  # (batch,)
+
+            for j in range(logits.shape[0]):
+                last_logits = logits[j, last_pos[j]]  # (vocab_size,)
+                yes_logit = last_logits[yes_token_id].item()
+                no_logit = last_logits[no_token_id].item()
+                # Score: P(Yes) from softmax over Yes/No
+                score = torch.softmax(
+                    torch.tensor([yes_logit, no_logit]), dim=0
+                )[0].item()
+                all_max_act.append(score)
 
             torch.cuda.empty_cache()
 
+        self.tokenizer.padding_side = orig_padding_side
         return {"max_act": all_max_act}
 
     def predict_latents(self, examples, **kwargs):
