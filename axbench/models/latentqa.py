@@ -415,6 +415,11 @@ class LatentQAReadingRating(LatentQAReading):
                 completion = self.tokenizer.decode(
                     out[j][num_tokens:], skip_special_tokens=True)
                 rating = self._get_rating_from_completion(completion)
+                if len(all_max_act) < 20:
+                    text = batch_examples.iloc[j].get("output", "")[:80]
+                    logger.warning(
+                        f"[LQA Rating] text={text}... "
+                        f"completion={completion!r} rating={rating}")
                 all_max_act.append(rating)
 
             torch.cuda.empty_cache()

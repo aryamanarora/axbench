@@ -30,7 +30,7 @@ json.dump(config, open('${DUMP_DIR}/inference/config.json', 'w'))
 "
 fi
 
-torchrun --nproc_per_node=1 axbench/scripts/inference.py \
+torchrun --nproc_per_node=1 --master_port=29505 axbench/scripts/inference.py \
     --config axbench/sweep/aryaman/activation_oracle/reading_llama3_1_8b.yaml \
     --mode latent --dump_dir "${DUMP_DIR}" \
     --overwrite_inference_data_dir "${DUMP_DIR}/inference"

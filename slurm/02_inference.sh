@@ -21,7 +21,7 @@ DUMP_DIR=results/latentqa_detection
 CONFIG=axbench/sweep/aryaman/latentqa/reading_llama3_8b.yaml
 
 echo "Running LatentQA detection inference..."
-torchrun --nproc_per_node=1 axbench/scripts/inference.py \
+torchrun --nproc_per_node=1 --master_port=29500 axbench/scripts/inference.py \
     --config "$CONFIG" \
     --mode latent \
     --dump_dir "$DUMP_DIR" \

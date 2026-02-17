@@ -215,7 +215,6 @@ class ActivationOracleReading(BaseModel):
         # Oracle config — auto-detect LoRA path from model name if not provided
         _ORACLE_LORA_MAP = {
             "meta-llama/Llama-3.1-8B-Instruct": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Llama-3_1-8B-Instruct",
-            "meta-llama/Meta-Llama-3-8B-Instruct": "adamkarvonen/checkpoints_latentqa_cls_past_lens_Llama-3_1-8B-Instruct",
             "Qwen/Qwen3-8B": "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B",
         }
         model_name_str = getattr(tokenizer, "name_or_path", "")
@@ -602,6 +601,10 @@ class ActivationOracleReadingRating(ActivationOracleReading):
                 completion = self.tokenizer.decode(
                     completion_ids, skip_special_tokens=True)
                 rating = self._get_rating_from_completion(completion)
+                if len(all_max_act) < 20:
+                    logger.warning(
+                        f"[AO Rating] text={texts[b][:80]}... "
+                        f"completion={completion!r} rating={rating}")
                 all_max_act.append(rating)
 
             torch.cuda.empty_cache()

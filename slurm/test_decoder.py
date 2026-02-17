@@ -86,6 +86,7 @@ def main():
     print("  'neg'            — pick a random negative row")
     print("  'concept N'      — pick from concept N")
     print("  'quit'           — exit")
+    print("  'rate'           — ask the rating question for this row's concept")
     print("  anything else    — ask that question to the decoder\n")
 
     current_row = None
@@ -189,6 +190,19 @@ def main():
                 pick_row(df[df.concept_id == cid])
             except (ValueError, IndexError):
                 print("Usage: concept <number>")
+        elif cmd.lower() == "rate":
+            if current_row is None:
+                print("Pick a row first.")
+                continue
+            concept_name = current_row.get("output_concept", "unknown")
+            rating_q = (
+                f"Is the following concept present in the text? Concept: '{concept_name}'. "
+                "Answer with a rating from 0 to 2, where 0 means the concept is not present at all, "
+                "1 means the concept is somewhat present, and 2 means the concept is strongly present. "
+                "Provide your rating using this exact format: Rating: [[score]]."
+            )
+            print(f"Concept: {concept_name}")
+            ask_question(rating_q)
         else:
             ask_question(cmd)
 
