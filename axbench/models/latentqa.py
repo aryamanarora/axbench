@@ -937,16 +937,17 @@ class LatentQAGradientSteering(BaseModel):
                 modify_chat_template=self.modify_chat_template,
             )
 
-            grad_cache = []
+            # Use forward hook to capture the output tensor (which retains grad
+            # when cache_target_model_grad=True), then read .grad after backward.
+            activation_cache = []
 
-            def grad_hook(module, grad_input, grad_output):
-                if isinstance(grad_output, tuple):
-                    grad_cache.append(grad_output[0].detach())
-                else:
-                    grad_cache.append(grad_output.detach())
+            def fwd_hook(module, input, output):
+                out_tensor = output[0] if isinstance(output, tuple) else output
+                out_tensor.retain_grad()
+                activation_cache.append(out_tensor)
 
             hook_handles = [
-                mod.register_full_backward_hook(grad_hook)
+                mod.register_forward_hook(fwd_hook)
                 for mod in module_read[0]
             ]
 
@@ -969,9 +970,9 @@ class LatentQAGradientSteering(BaseModel):
             for h in hook_handles:
                 h.remove()
 
-            if grad_cache:
+            if activation_cache and activation_cache[0].grad is not None:
                 # Average over batch and sequence dims, negate for gradient descent
-                avg_grad = -grad_cache[0].mean(dim=(0, 1)).float().cpu()
+                avg_grad = -activation_cache[0].grad.mean(dim=(0, 1)).float().cpu()
                 all_grads.append(avg_grad)
 
             self.model.zero_grad()
