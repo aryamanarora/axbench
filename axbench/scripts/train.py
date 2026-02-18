@@ -461,7 +461,7 @@ def main():
                 intervention_positions_dropout=args.models[model_name].intervention_positions_dropout,
                 preference_pairs=args.models[model_name].preference_pairs,
             )
-            if model_name not in {"LoReFT", "LoRA", "SFT", "BoW", "PreferenceLoReFT", "ConceptLoReFT"} and args.use_bf16:
+            if model_name not in {"LoReFT", "LoRA", "SFT", "BoW", "PreferenceLoReFT", "ConceptLoReFT", "LatentQAGradientSteering", "LatentQASteering", "LatentQAReading", "LatentQAReadingRating"} and args.use_bf16:
                 if isinstance(benchmark_model.ax, list):
                     for ax in benchmark_model.ax:
                         ax.to(torch.bfloat16)
