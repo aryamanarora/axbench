@@ -830,6 +830,7 @@ class LatentQAGradientSteering(BaseModel):
         self.num_layers_to_read = kwargs.get("num_layers_to_read", 1)
         self.layer_to_write = kwargs.get("layer_to_write", 0)
         self.modify_chat_template = kwargs.get("modify_chat_template", True)
+        self.gradient_batch_size = kwargs.get("gradient_batch_size", 4)
 
         self.decoder_model = None
         self.steering_vectors = None  # (num_concepts, hidden_dim)
@@ -880,7 +881,7 @@ class LatentQAGradientSteering(BaseModel):
         answer_text = "Rating: [[2]]"
 
         # Build read prompts from actual dataset examples
-        probe_data = []
+        all_probe_data = []
         for _, row in examples.iterrows():
             user_text = row.get("input", "")
             assistant_text = row.get("output", "")
@@ -893,7 +894,7 @@ class LatentQAGradientSteering(BaseModel):
                 add_generation_prompt=False,
                 chat_template=chat_template,
             )
-            probe_data.append({
+            all_probe_data.append({
                 "read_prompt": read_prompt,
                 "dialog": BASE_DIALOG + [
                     {"role": "user", "content": question_text},
@@ -905,68 +906,73 @@ class LatentQAGradientSteering(BaseModel):
         orig_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
 
-        batch = tokenize_fn(
-            probe_data,
-            self.tokenizer,
-            name=self.target_model_name,
-            generate=False,  # include labels for loss computation
-            mask_type=None,
-            mask_all_but_last=True,
-            modify_chat_template=self.modify_chat_template,
-        )
+        # Process in mini-batches to avoid OOM (gradient computation is memory-heavy)
+        batch_size = self.gradient_batch_size
+        all_grads = []
 
-        # Register backward hook on the read layer BEFORE forward pass
-        # so it captures the gradient during backward.
-        grad_cache = []
+        for i in range(0, len(all_probe_data), batch_size):
+            probe_data = all_probe_data[i:i + batch_size]
 
-        def grad_hook(module, grad_input, grad_output):
-            if isinstance(grad_output, tuple):
-                grad_cache.append(grad_output[0].detach())
-            else:
-                grad_cache.append(grad_output.detach())
+            batch = tokenize_fn(
+                probe_data,
+                self.tokenizer,
+                name=self.target_model_name,
+                generate=False,
+                mask_type=None,
+                mask_all_but_last=True,
+                modify_chat_template=self.modify_chat_template,
+            )
 
-        hook_handles = [
-            mod.register_full_backward_hook(grad_hook)
-            for mod in module_read[0]
-        ]
+            grad_cache = []
 
-        # Forward: target model → activation cache → decoder with labels
-        out = latent_qa(
-            batch,
-            self.model,
-            self.decoder_model,
-            module_read[0],
-            module_write[0],
-            self.tokenizer,
-            shift_position_ids=True,
-            generate=False,
-            cache_target_model_grad=True,  # enables gradient on target acts
-            no_grad=False,
-        )
+            def grad_hook(module, grad_input, grad_output):
+                if isinstance(grad_output, tuple):
+                    grad_cache.append(grad_output[0].detach())
+                else:
+                    grad_cache.append(grad_output.detach())
 
-        # Backward: gradient flows decoder → cached activations → target layer
-        loss = out.loss
-        loss.backward()
+            hook_handles = [
+                mod.register_full_backward_hook(grad_hook)
+                for mod in module_read[0]
+            ]
 
-        # Remove hooks
-        for h in hook_handles:
-            h.remove()
+            out = latent_qa(
+                batch,
+                self.model,
+                self.decoder_model,
+                module_read[0],
+                module_write[0],
+                self.tokenizer,
+                shift_position_ids=True,
+                generate=False,
+                cache_target_model_grad=True,
+                no_grad=False,
+            )
+
+            loss = out.loss
+            loss.backward()
+
+            for h in hook_handles:
+                h.remove()
+
+            if grad_cache:
+                # Average over batch and sequence dims, negate for gradient descent
+                avg_grad = -grad_cache[0].mean(dim=(0, 1)).float().cpu()
+                all_grads.append(avg_grad)
+
+            self.model.zero_grad()
+            self.decoder_model.zero_grad()
+            torch.cuda.empty_cache()
 
         self.tokenizer.padding_side = orig_padding_side
 
-        if not grad_cache:
-            logger.error(f"No gradient captured for concept '{concept}'")
+        if not all_grads:
+            logger.error(f"No gradients collected for concept '{concept}'")
             hidden_dim = self.model.config.hidden_size
             return torch.zeros(hidden_dim)
 
-        # grad_cache[0] shape: (batch, seq_len, hidden_dim)
-        # Average over batch and sequence dims, negate for gradient descent
-        steering_vector = -grad_cache[0].mean(dim=(0, 1)).float().cpu()
-
-        # Clean up
-        self.model.zero_grad()
-        self.decoder_model.zero_grad()
-        torch.cuda.empty_cache()
+        # Average across mini-batches
+        steering_vector = torch.stack(all_grads).mean(dim=0)
 
         # Normalize to unit length for consistent scaling with factors
         norm = steering_vector.norm()
