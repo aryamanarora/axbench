@@ -473,6 +473,9 @@ def main():
                 "exclude_bos": args.models[model_name].exclude_bos,
                 "metadata_path": metadata_path,
                 "use_dpo_loss": args.use_dpo_loss,
+                "concept": concept,
+                "concept_id": concept_id,
+                "dump_dir": str(dump_dir),
                 "logging_metadata": {
                     "concept_id": concept_id,
                     "model_name": model_name,
