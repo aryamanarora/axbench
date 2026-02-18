@@ -25,6 +25,13 @@ dependencies = [
     "stanza>=1.11.0",
 ]
 
+[project.optional-dependencies]
+glp = [
+    "glp @ git+https://github.com/g-luo/generative_latent_prior.git",
+    "diffusers>=0.30",
+    "omegaconf>=2.3",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
