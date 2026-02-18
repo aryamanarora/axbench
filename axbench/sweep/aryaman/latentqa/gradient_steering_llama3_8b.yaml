@@ -45,6 +45,7 @@ train:
   component: "res"
   seed: 42
   use_bf16: true
+  output_length: 128
   models:
     LatentQAGradientSteering:
       batch_size: 1
