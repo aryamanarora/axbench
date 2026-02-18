@@ -483,6 +483,13 @@ class LatentQASteering(BaseModel):
             return
         self.decoder_model = _load_decoder_model(
             self.target_model_name, self.decoder_model_name, self.decoder_device)
+        # Ensure decoder vocab matches target model (e.g. if PAD token was added)
+        target_vocab_size = self.model.get_input_embeddings().weight.shape[0]
+        decoder_vocab_size = self.decoder_model.get_input_embeddings().weight.shape[0]
+        if target_vocab_size != decoder_vocab_size:
+            logger.warning(
+                f"Resizing decoder embeddings from {decoder_vocab_size} to {target_vocab_size}")
+            self.decoder_model.resize_token_embeddings(target_vocab_size)
 
     def _generate_qa_pairs(self, concept, num_questions=15):
         """Generate QA pairs for a concept using LatentQA reading mode.
@@ -848,6 +855,13 @@ class LatentQAGradientSteering(BaseModel):
             return
         self.decoder_model = _load_decoder_model(
             self.target_model_name, self.decoder_model_name, self.decoder_device)
+        # Ensure decoder vocab matches target model (e.g. if PAD token was added)
+        target_vocab_size = self.model.get_input_embeddings().weight.shape[0]
+        decoder_vocab_size = self.decoder_model.get_input_embeddings().weight.shape[0]
+        if target_vocab_size != decoder_vocab_size:
+            logger.warning(
+                f"Resizing decoder embeddings from {decoder_vocab_size} to {target_vocab_size}")
+            self.decoder_model.resize_token_embeddings(target_vocab_size)
 
     def _compute_steering_vector(self, examples, concept):
         """Compute a steering vector for a concept via decoder-loss gradients.
