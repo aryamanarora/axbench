@@ -293,9 +293,39 @@ class GLPAdditionIntervention(AdditionIntervention):
         self.postprocess_fn = None
 
     def set_glp_model(self, glp_model, u=0.5, num_timesteps=20):
-        from glp.script_steer import postprocess_on_manifold_wrapper
-        self.postprocess_fn = postprocess_on_manifold_wrapper(
-            glp_model, u=u, num_timesteps=num_timesteps, layer_idx=None)
+        import einops
+        from glp.flow_matching import fm_prepare, sample_on_manifold
+
+        scheduler = glp_model.scheduler
+        scheduler.set_timesteps(num_timesteps)
+
+        def postprocess_fn(acts_edit):
+            has_seq_dim = len(acts_edit.shape) == 3
+            b = acts_edit.shape[0]
+            latents = acts_edit
+            if has_seq_dim:
+                latents = einops.rearrange(latents, "b s d -> (b s) 1 d")
+            else:
+                latents = einops.rearrange(latents, "b d -> b 1 d")
+            latents = glp_model.normalizer.normalize(latents, layer_idx=None)
+            noise = torch.randn_like(latents)
+            noisy_latents, _, timesteps, _ = fm_prepare(
+                scheduler, latents, noise,
+                u=torch.ones(latents.shape[0]) * u,
+            )
+            latents = sample_on_manifold(
+                glp_model, noisy_latents,
+                start_timestep=timesteps[0].item(),
+                num_timesteps=num_timesteps, layer_idx=None,
+            )
+            latents = glp_model.normalizer.denormalize(latents, layer_idx=None)
+            if has_seq_dim:
+                latents = einops.rearrange(latents, "(b s) 1 d -> b s d", b=b)
+            else:
+                latents = einops.rearrange(latents, "b 1 d -> b d")
+            return latents.to(device=acts_edit.device, dtype=acts_edit.dtype)
+
+        self.postprocess_fn = postprocess_fn
 
     def forward(self, base, source=None, subspaces=None):
         steering_vec = subspaces["max_act"].unsqueeze(dim=-1) * \
