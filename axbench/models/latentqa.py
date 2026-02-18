@@ -802,8 +802,8 @@ class LatentQAGradientSteering(BaseModel):
     """Gradient-based steering using LatentQA decoder loss.
 
     Computes d(decoder_loss) / d(target_activations) to get a steering
-    direction, then applies it as an activation addition during generation.
-    Uses the same concept detection prompt as LatentQAReading.
+    direction, then stores it in self.ax.proj.weight for compatibility
+    with the standard axbench save/load/predict_steer pipeline.
 
     Much cheaper than LatentQASteering (LoRA):
     - No per-concept LoRA training
@@ -811,11 +811,12 @@ class LatentQAGradientSteering(BaseModel):
     - Produces a steering vector that naturally supports factor scaling
 
     The flow:
-    1. train(): For each concept, run target model on concept-embodying prompts,
-       feed activations to decoder with QA pair confirming concept presence,
+    1. train(): For each concept, run target model on dataset examples,
+       feed activations to decoder with rating question (target: "Rating: [[2]]"),
        backprop to get gradient on activations, average → steering vector.
-    2. predict_steer(): Hook into target model layer, add
-       factor * steering_vector to hidden states during generation.
+       Store in self.ax.proj.weight for standard save/load.
+    2. predict_steer(): Inherited from Model — uses IntervenableModel
+       with AdditionIntervention for activation addition during generation.
     """
 
     def __init__(self, model, tokenizer, layer=15, training_args=None, **kwargs):
@@ -823,9 +824,14 @@ class LatentQAGradientSteering(BaseModel):
         self.tokenizer = tokenizer
         self.layer = layer
         self.training_args = training_args
+        self.max_activations = {}
         self.device = kwargs.get("device", "cuda:0")
         self.decoder_device = kwargs.get("decoder_device", "cuda:1")
         self.seed = kwargs.get("seed", 42)
+        self.steering_layers = kwargs.get("steering_layers", None)
+        self.num_of_layers = len(self.steering_layers) if self.steering_layers else 1
+        self.dump_dir = kwargs.get("dump_dir", None)
+        self.use_wandb = kwargs.get("use_wandb", False)
 
         # LatentQA-specific config
         self.decoder_model_name = kwargs.get(
@@ -840,14 +846,147 @@ class LatentQAGradientSteering(BaseModel):
         self.gradient_batch_size = kwargs.get("gradient_batch_size", 4)
 
         self.decoder_model = None
-        self.steering_vectors = None  # (num_concepts, hidden_dim)
-        self.max_activations = {}
 
     def __str__(self):
         return 'LatentQAGradientSteering'
 
     def make_model(self, **kwargs):
-        pass
+        """Set up self.ax (and self.ax_model for steering), same as MeanEmbedding."""
+        from .mean import LogisticRegressionModel
+        from .interventions import AdditionIntervention
+        from pyvene import IntervenableConfig, IntervenableModel
+
+        mode = kwargs.get("mode", "train")
+        intervention_type = kwargs.get("intervention_type", "addition")
+        if mode == "steering":
+            ax = AdditionIntervention(
+                embed_dim=self.model.config.hidden_size,
+                low_rank_dimension=kwargs.get("low_rank_dimension", 1),
+            )
+            self.ax = ax
+            self.ax.train()
+            ax_config = IntervenableConfig(representations=[{
+                "layer": l,
+                "component": f"model.layers[{l}].output",
+                "low_rank_dimension": kwargs.get("low_rank_dimension", 1),
+                "intervention": self.ax} for l in [self.layer]])
+            ax_model = IntervenableModel(ax_config, self.model)
+            ax_model.set_device(self.device)
+            self.ax_model = ax_model
+        else:
+            ax = LogisticRegressionModel(
+                self.model.config.hidden_size, kwargs.get("low_rank_dimension", 1))
+            ax.to(self.device)
+            self.ax = ax
+
+    def save(self, dump_dir, **kwargs):
+        """Save steering vector via self.ax.proj.weight/bias (standard format)."""
+        from pathlib import Path
+        dump_dir = Path(dump_dir)
+        model_name = kwargs.get("model_name", self.__str__())
+        weight_file = dump_dir / f"{model_name}_weight.pt"
+        weight = self.ax.proj.weight.data.cpu()
+        if weight_file.exists():
+            weight = torch.cat([torch.load(weight_file), weight], dim=0)
+        torch.save(weight, weight_file)
+
+        bias_file = dump_dir / f"{model_name}_bias.pt"
+        bias = self.ax.proj.bias.data.cpu()
+        if bias_file.exists():
+            bias = torch.cat([torch.load(bias_file), bias], dim=0)
+        torch.save(bias, bias_file)
+
+    def load(self, dump_dir=None, **kwargs):
+        """Load steering vectors (standard _weight.pt/_bias.pt format)."""
+        if dump_dir is None:
+            return
+        model_name = kwargs.get("model_name", self.__str__())
+        print(f"Loading {model_name} from {dump_dir}.")
+        weight = torch.load(
+            f"{dump_dir}/{model_name}_weight.pt",
+            map_location=torch.device("cpu"),
+        )
+        bias = torch.load(
+            f"{dump_dir}/{model_name}_bias.pt",
+            map_location=torch.device("cpu"),
+        )
+        kwargs["low_rank_dimension"] = weight.shape[0]
+        self.make_model(**kwargs)
+        self.ax.proj.weight.data = weight.to(self.device)
+        self.ax.proj.bias.data = bias.to(self.device)
+
+    @torch.no_grad()
+    def predict_steer(self, examples, **kwargs):
+        """Inherited steering logic from Model using IntervenableModel."""
+        self.ax.eval()
+        self.tokenizer.padding_side = "left"
+        concept_id_col = "concept_id"
+
+        batch_size = kwargs.get("batch_size", 64)
+        eval_output_length = kwargs.get("eval_output_length", 128)
+        temperature = kwargs.get("temperature", 1.0)
+        all_generations = []
+        all_strengths = []
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        progress_bar = tqdm(range(0, len(examples), batch_size), position=rank, leave=True)
+        for i in range(0, len(examples), batch_size):
+            batch_examples = examples.iloc[i:i+batch_size]
+            input_strings = batch_examples['input'].tolist()
+            mag = torch.tensor(batch_examples['factor'].tolist()).to(self.device)
+            idx = torch.tensor(batch_examples["concept_id"].tolist()).to(self.device)
+            max_acts = torch.tensor([
+                self.max_activations.get(id, 1.0)
+                for id in batch_examples[concept_id_col].tolist()]).to(self.device)
+            inputs = self.tokenizer(
+                input_strings, return_tensors="pt", padding=True, truncation=True
+            ).to(self.device)
+            _, generations = self.ax_model.generate(
+                inputs,
+                unit_locations=None, intervene_on_prompt=True,
+                subspaces=[{"idx": idx, "mag": mag, "max_act": max_acts,
+                            "prefix_length": kwargs["prefix_length"]}]*self.num_of_layers,
+                max_new_tokens=eval_output_length, do_sample=True,
+                temperature=temperature,
+            )
+            input_lengths = [len(input_ids) for input_ids in inputs.input_ids]
+            generated_texts = [
+                self.tokenizer.decode(generation[input_length:], skip_special_tokens=True)
+                for generation, input_length in zip(generations, input_lengths)
+            ]
+            all_generations += generated_texts
+            all_strengths.extend((mag*max_acts).tolist())
+            progress_bar.update(1)
+
+        return {
+            "steered_generation": all_generations,
+            "strength": all_strengths,
+        }
+
+    def pre_compute_mean_activations(self, dump_dir, **kwargs):
+        max_activations = {}
+        for file in os.listdir(dump_dir):
+            if file.startswith("latent_") and file.endswith(".parquet"):
+                import pandas as pd
+                latent_path = os.path.join(dump_dir, file)
+                latent = pd.read_parquet(latent_path)
+                for concept_id in sorted(latent["concept_id"].unique()):
+                    concept_latent = latent[latent["concept_id"] == concept_id]
+                    max_act = concept_latent[f"{self.__str__()}_max_act"].max()
+                    max_activations[concept_id] = max_act if max_act > 0 else 50
+        self.max_activations = max_activations
+        return max_activations
+
+    def to(self, device):
+        self.device = device
+        if hasattr(self, 'ax'):
+            self.ax = self.ax.to(device)
+            if hasattr(self, 'ax_model'):
+                from pyvene import IntervenableModel
+                if isinstance(self.ax_model, IntervenableModel):
+                    self.ax_model.set_device(device)
+                else:
+                    self.ax_model = self.ax_model.to(device)
+        return self
 
     def _load_decoder(self):
         """Load the LatentQA decoder model if not already loaded."""
@@ -866,8 +1005,8 @@ class LatentQAGradientSteering(BaseModel):
     def _compute_steering_vector(self, examples, concept):
         """Compute a steering vector for a concept via decoder-loss gradients.
 
-        Uses actual dataset examples as read prompts. For each example:
-        1. Run target model on the example → get activations at read layer (with grad)
+        Uses actual dataset examples as read prompts. For each mini-batch:
+        1. Run target model on examples → get activations at read layer (with grad)
         2. Feed activations to decoder with rating question, target answer = "Rating: [[2]]"
         3. Compute cross-entropy loss on the answer
         4. Backprop → gradient on target activations
@@ -996,14 +1135,16 @@ class LatentQAGradientSteering(BaseModel):
         return steering_vector
 
     def train(self, examples, **kwargs):
-        """Compute gradient-based steering vectors for each concept.
-
-        For each concept, computes the gradient of the decoder loss
-        w.r.t. target model activations, averaged over diverse prompts.
-        """
+        """Compute gradient steering vector and store in self.ax.proj.weight."""
         self._load_decoder()
         concept = kwargs.get("concept", "")
-        concept_id = kwargs.get("concept_id", 0)
+
+        # Initialize self.ax if not already done
+        if not hasattr(self, 'ax'):
+            from .mean import LogisticRegressionModel
+            self.ax = LogisticRegressionModel(
+                self.model.config.hidden_size, 1)
+            self.ax.to(self.device)
 
         logger.warning(f"Computing gradient steering vector for concept: {concept}")
 
@@ -1012,150 +1153,6 @@ class LatentQAGradientSteering(BaseModel):
 
         steering_vector = self._compute_steering_vector(examples, concept)
 
-        # Accumulate for save()
-        if not hasattr(self, '_accumulated_vectors'):
-            self._accumulated_vectors = []
-        self._accumulated_vectors.append(steering_vector)
-
-        return steering_vector
-
-    def save(self, dump_dir, **kwargs):
-        """Save accumulated steering vectors."""
-        model_name = kwargs.get("model_name", self.__str__())
-        weight_file = os.path.join(str(dump_dir), f"{model_name}_vectors.pt")
-
-        if hasattr(self, '_accumulated_vectors') and self._accumulated_vectors:
-            vectors = torch.stack(self._accumulated_vectors)
-        elif self.steering_vectors is not None:
-            vectors = self.steering_vectors
-        else:
-            return
-
-        # Append to existing file if present
-        if os.path.exists(weight_file):
-            existing = torch.load(weight_file, map_location="cpu")
-            vectors = torch.cat([existing, vectors], dim=0)
-
-        torch.save(vectors, weight_file)
-        logger.warning(f"Saved {vectors.shape[0]} steering vectors to {weight_file}")
-
-    def load(self, dump_dir=None, **kwargs):
-        """Load steering vectors."""
-        model_name = kwargs.get("model_name", self.__str__())
-        mode = kwargs.get("mode", "steering")
-
-        if dump_dir is not None:
-            # Try both plain and rank-prefixed names
-            candidates = [
-                os.path.join(str(dump_dir), f"{model_name}_vectors.pt"),
-                os.path.join(str(dump_dir), f"rank_0_{model_name}_vectors.pt"),
-            ]
-            for weight_file in candidates:
-                if os.path.exists(weight_file):
-                    self.steering_vectors = torch.load(
-                        weight_file, map_location="cpu")
-                    logger.warning(
-                        f"Loaded {self.steering_vectors.shape[0]} steering vectors from {weight_file}")
-                    return
-            else:
-                logger.warning(f"No steering vectors found at {weight_file}")
-
-    @torch.no_grad()
-    def predict_steer(self, examples, **kwargs):
-        """Generate steered text by adding scaled steering vectors to activations.
-
-        For each example, hooks into the target model's read layer and adds
-        factor * steering_vector to the hidden states during generation.
-        """
-        self.model.eval()
-        self.tokenizer.padding_side = "left"
-
-        batch_size = kwargs.get("batch_size", 8)
-        eval_output_length = kwargs.get("eval_output_length", 128)
-        temperature = kwargs.get("temperature", 1.0)
-
-        all_generations = []
-        all_strengths = []
-
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        progress_bar = tqdm(
-            range(0, len(examples), batch_size), position=rank, leave=True)
-
-        # Get the target layer module for hooking
-        target_path = _get_model_layers_str(self.model)
-        def get_layer(model, path, idx):
-            obj = model
-            for attr in path.split("."):
-                obj = getattr(obj, attr)
-            return obj[idx]
-
-        steer_layer = get_layer(self.model, target_path, self.min_layer_to_read)
-
-        for i in range(0, len(examples), batch_size):
-            batch_examples = examples.iloc[i:i + batch_size]
-            input_strings = batch_examples['input'].tolist()
-            factors = torch.tensor(batch_examples['factor'].tolist())
-            concept_ids = batch_examples['concept_id'].tolist()
-
-            # Build per-example steering vectors scaled by factor
-            batch_steer = []
-            for j, (cid, f) in enumerate(zip(concept_ids, factors)):
-                if self.steering_vectors is not None and cid < len(self.steering_vectors):
-                    vec = self.steering_vectors[cid].to(self.device) * f.item()
-                else:
-                    vec = torch.zeros(self.model.config.hidden_size, device=self.device)
-                batch_steer.append(vec)
-            batch_steer = torch.stack(batch_steer)  # (batch, hidden_dim)
-
-            # Register forward hook that adds the steering vector
-            def make_hook(steer_vecs):
-                def hook_fn(module, input, output):
-                    if isinstance(output, tuple):
-                        hidden = output[0]
-                    else:
-                        hidden = output
-                    # Add steering vector to all sequence positions
-                    bsz = min(hidden.shape[0], steer_vecs.shape[0])
-                    hidden[:bsz] = hidden[:bsz] + steer_vecs[:bsz].unsqueeze(1)
-                    if isinstance(output, tuple):
-                        return (hidden,) + output[1:]
-                    return hidden
-                return hook_fn
-
-            hook_handle = steer_layer.register_forward_hook(
-                make_hook(batch_steer))
-
-            inputs = self.tokenizer(
-                input_strings, return_tensors="pt", padding=True, truncation=True
-            ).to(self.device)
-
-            generations = self.model.generate(
-                **inputs,
-                max_new_tokens=eval_output_length,
-                do_sample=True,
-                temperature=temperature,
-            )
-
-            hook_handle.remove()
-
-            input_lengths = [len(input_ids) for input_ids in inputs.input_ids]
-            generated_texts = [
-                self.tokenizer.decode(
-                    generation[input_length:], skip_special_tokens=True)
-                for generation, input_length in zip(generations, input_lengths)
-            ]
-            all_generations += generated_texts
-            all_strengths.extend(factors.tolist())
-            progress_bar.update(1)
-
-        return {
-            "steered_generation": all_generations,
-            "strength": all_strengths,
-        }
-
-    def pre_compute_mean_activations(self, dump_dir, **kwargs):
-        return {}
-
-    def to(self, device):
-        self.device = device
-        return self
+        # Store in self.ax.proj.weight for standard save/load
+        self.ax.proj.weight.data = steering_vector.unsqueeze(0).to(self.device)
+        self.ax.proj.bias.data = torch.zeros(1).to(self.device)
