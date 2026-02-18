@@ -1011,6 +1011,12 @@ class LatentQAGradientSteering(BaseModel):
         torch.manual_seed(self.seed)
 
         steering_vector = self._compute_steering_vector(examples, concept)
+
+        # Accumulate for save()
+        if not hasattr(self, '_accumulated_vectors'):
+            self._accumulated_vectors = []
+        self._accumulated_vectors.append(steering_vector)
+
         return steering_vector
 
     def save(self, dump_dir, **kwargs):
@@ -1039,12 +1045,18 @@ class LatentQAGradientSteering(BaseModel):
         mode = kwargs.get("mode", "steering")
 
         if dump_dir is not None:
-            weight_file = os.path.join(str(dump_dir), f"{model_name}_vectors.pt")
-            if os.path.exists(weight_file):
-                self.steering_vectors = torch.load(
-                    weight_file, map_location="cpu")
-                logger.warning(
-                    f"Loaded {self.steering_vectors.shape[0]} steering vectors from {weight_file}")
+            # Try both plain and rank-prefixed names
+            candidates = [
+                os.path.join(str(dump_dir), f"{model_name}_vectors.pt"),
+                os.path.join(str(dump_dir), f"rank_0_{model_name}_vectors.pt"),
+            ]
+            for weight_file in candidates:
+                if os.path.exists(weight_file):
+                    self.steering_vectors = torch.load(
+                        weight_file, map_location="cpu")
+                    logger.warning(
+                        f"Loaded {self.steering_vectors.shape[0]} steering vectors from {weight_file}")
+                    return
             else:
                 logger.warning(f"No steering vectors found at {weight_file}")
 
