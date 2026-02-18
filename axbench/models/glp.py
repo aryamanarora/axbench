@@ -44,9 +44,8 @@ GLP_HF_REPO = "generative-latent-prior/glp-llama8b-d6"
 
 def _load_glp_model(repo_id=GLP_HF_REPO, device="cuda:0"):
     """Load a pre-trained GLP denoiser from HuggingFace."""
-    from glp.model import load_glp_model
-    glp_model = load_glp_model(repo_id)
-    glp_model = glp_model.to(device)
+    from glp.denoiser import load_glp
+    glp_model = load_glp(repo_id, device=device)
     glp_model.eval()
     return glp_model
 
