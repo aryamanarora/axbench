@@ -18,9 +18,10 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
 DUMP_DIR=results/glp_diffmean
 CONFIG=axbench/sweep/aryaman/glp/glp_diffmean_llama3_8b.yaml
 
+mkdir -p "$DUMP_DIR/inference"
+
 # Symlink generated data from existing run
 if [ ! -d "$DUMP_DIR/generate" ]; then
-    mkdir -p "$DUMP_DIR"
     ln -s /home/aryaman/axbench/results/latentqa_detection/generate "$DUMP_DIR/generate"
 fi
 
