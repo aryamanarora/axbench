@@ -266,7 +266,7 @@ class ConceptReFTIntervention(
 
 class AdditionIntervention(
     SourcelessIntervention,
-    TrainableIntervention, 
+    TrainableIntervention,
     DistributedRepresentationIntervention
 ):
     def __init__(self, **kwargs):
@@ -282,6 +282,28 @@ class AdditionIntervention(
             subspaces["mag"].unsqueeze(dim=-1) * self.proj.weight[subspaces["idx"]]
         output = base + steering_vec.unsqueeze(dim=1)
         return output
+
+
+class GLPAdditionIntervention(AdditionIntervention):
+    """AdditionIntervention with GLP post-processing to snap steered activations
+    back onto the natural activation manifold."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.postprocess_fn = None
+
+    def set_glp_model(self, glp_model, u=0.5, num_timesteps=20):
+        from glp.script_steer import postprocess_on_manifold_wrapper
+        self.postprocess_fn = postprocess_on_manifold_wrapper(
+            glp_model, u=u, num_timesteps=num_timesteps, layer_idx=None)
+
+    def forward(self, base, source=None, subspaces=None):
+        steering_vec = subspaces["max_act"].unsqueeze(dim=-1) * \
+            subspaces["mag"].unsqueeze(dim=-1) * self.proj.weight[subspaces["idx"]]
+        steered = base + steering_vec.unsqueeze(dim=1)
+        if self.postprocess_fn is not None:
+            steered = self.postprocess_fn(steered)
+        return steered
     
 
 class AdditionSuppressionIntervention(

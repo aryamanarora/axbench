@@ -36,6 +36,7 @@ from .models.concept_vector import *
 from .models.hypersteer import *
 from .models.latentqa import *
 from .models.activation_oracle import *
+from .models.glp import *
 
 from .models.hypernet.configuration_hypernet import *
 from .models.hypernet.layers import *
