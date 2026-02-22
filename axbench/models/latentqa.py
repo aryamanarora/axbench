@@ -1331,22 +1331,24 @@ class LatentQAActivationSteering(BaseModel):
             # Optimize activations
             delta = self._optimize_activations(input_text, concept, factor)
 
-            # Generate with optimized activations injected
+            # Generate with optimized activations injected (prompt prefill only)
+            prefill_done = [False]
+
             def generation_hook(module, input, output, _delta=delta):
-                if _delta is None:
+                if _delta is None or prefill_done[0]:
                     return output
                 out_tensor = output[0] if isinstance(output, tuple) else output
-                # Delta has shape from the probe pass; for generation we add to
-                # all positions (or last token if shapes differ)
-                if _delta.shape[1] <= out_tensor.shape[1]:
+                # Only intervene on the prefill pass (full prompt), not autoregressive steps
+                if out_tensor.shape[1] > 1:
+                    prefill_done[0] = True
                     out_tensor = out_tensor.clone()
-                    out_tensor[:, :_delta.shape[1], :] += _delta.to(out_tensor.device, out_tensor.dtype)
-                else:
-                    out_tensor = out_tensor.clone()
-                    out_tensor += _delta[:, :out_tensor.shape[1], :].to(out_tensor.device, out_tensor.dtype)
-                if isinstance(output, tuple):
-                    return (out_tensor,) + output[1:]
-                return out_tensor
+                    # Add delta to matching positions
+                    seq_len = min(_delta.shape[1], out_tensor.shape[1])
+                    out_tensor[:, :seq_len, :] += _delta[:, :seq_len, :].to(out_tensor.device, out_tensor.dtype)
+                    if isinstance(output, tuple):
+                        return (out_tensor,) + output[1:]
+                    return out_tensor
+                return output
 
             hook_handle = module_read[0][0].register_forward_hook(generation_hook)
 
