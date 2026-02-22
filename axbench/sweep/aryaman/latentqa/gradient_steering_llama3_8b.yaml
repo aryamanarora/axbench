@@ -55,7 +55,7 @@ train:
       intervention_positions: "all"
       intervention_type: "addition"
       binarize_dataset: false
-      train_on_negative: false
+      train_on_negative: true
       exclude_bos: true
 
 inference:

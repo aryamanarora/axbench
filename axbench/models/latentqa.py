@@ -470,7 +470,6 @@ class LatentQASteering(BaseModel):
         self.lora_r = kwargs.get("lora_r", 16)
         self.lora_alpha = kwargs.get("lora_alpha", 32)
         self.steering_lr = kwargs.get("steering_lr", 1e-4)
-        self.steering_samples = kwargs.get("steering_samples", 50)
         self.steering_batch_size_train = kwargs.get("steering_batch_size_train", 1)
         self.layers_to_optimize = kwargs.get(
             "layers_to_optimize", tuple(range(16)))
@@ -499,86 +498,12 @@ class LatentQASteering(BaseModel):
                 f"Resizing decoder embeddings from {decoder_vocab_size} to {target_vocab_size}")
             self.decoder_model.resize_token_embeddings(target_vocab_size)
 
-    def _generate_qa_pairs(self, concept, num_questions=15):
-        """Generate QA pairs for a concept using LatentQA reading mode.
-
-        Creates a prompt embodying the concept, runs the target model on it,
-        and uses the decoder to generate descriptions of the activations.
-        """
-        _require_latentqa()
-        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
-
-        # Questions to probe the concept
-        questions = [
-            [f"What concept or theme is the assistant expressing?"],
-            [f"How does the assistant incorporate the concept of '{concept}'?"],
-            [f"Describe the assistant's behavior in terms of '{concept}'."],
-            [f"What characteristics related to '{concept}' are present?"],
-            [f"How strongly does '{concept}' influence the response?"],
-        ]
-
-        # Create a prompt that embodies the concept
-        concept_prompt = f"You must {concept} in all your responses."
-        read_prompt = self.tokenizer.apply_chat_template(
-            [{"role": "user", "content": concept_prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-            chat_template=chat_template,
-        )
-
-        probe_data = []
-        for q in questions:
-            dialog = _BASE_DIALOG + [{"role": "user", "content": q[0]}]
-            probe_data.append({
-                "read_prompt": read_prompt,
-                "dialog": dialog,
-            })
-
-        batch = _lqa_tokenize(
-            probe_data,
-            self.tokenizer,
-            name=self.target_model_name,
-            generate=True,
-            mask_type=None,
-            mask_all_but_last=True,
-            modify_chat_template=self.modify_chat_template,
-        )
-
-        module_read, module_write = _get_modules(
-            self.model, self.decoder_model,
-            min_layer=self.min_layer_to_read,
-            max_layer=self.max_layer_to_read,
-            layer_to_write=self.layer_to_write,
-            num_layers_to_read=self.num_layers_to_read,
-        )
-
-        out = _latent_qa(
-            batch,
-            self.model,
-            self.decoder_model,
-            module_read[0],
-            module_write[0],
-            self.tokenizer,
-            shift_position_ids=False,
-            generate=True,
-            max_new_tokens=100,
-            no_grad=True,
-        )
-
-        qa_pairs = []
-        for j in range(len(out)):
-            prompt = questions[j % len(questions)][0]
-            num_tokens = batch["tokenized_write"][j].shape[0]
-            completion = self.tokenizer.decode(out[j][num_tokens:], skip_special_tokens=True)
-            qa_pairs.append((prompt, completion))
-
-        return qa_pairs
-
     def train(self, examples, **kwargs):
-        """Generate QA pairs for the concept and optimize LoRA.
+        """Optimize LoRA to minimize decoder loss on Rating: [[2]].
 
-        For each concept, generates QA descriptions via reading mode,
-        then trains a LoRA adapter to match those descriptions.
+        Uses actual dataset examples as read prompts (same data/objective as
+        LatentQAGradientSteering) but optimizes a LoRA adapter iteratively
+        instead of taking a single gradient step.
         """
         _require_latentqa()
         from peft import LoraConfig, get_peft_model
@@ -587,18 +512,38 @@ class LatentQASteering(BaseModel):
         concept = kwargs.get("concept", "")
         concept_id = kwargs.get("concept_id", 0)
         dump_dir = kwargs.get("dump_dir", ".")
+        n_epochs = self.training_args.n_epochs if self.training_args else 1
+        batch_size = self.steering_batch_size_train
 
         logger.warning(f"Training LatentQASteering for concept: {concept}")
 
-        # Step 1: Generate QA pairs
-        qa_pairs = self._generate_qa_pairs(concept)
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING.format(concept=concept)
+        answer_text = "Rating: [[2]]"
 
-        # Save QA pairs
-        qa_path = os.path.join(dump_dir, f"latentqa_qa_concept_{concept_id}.json")
-        with open(qa_path, "w") as f:
-            json.dump(qa_pairs, f, indent=2)
+        # Build probe data from dataset examples (same as gradient steering)
+        all_probe_data = []
+        for _, row in examples.iterrows():
+            user_text = row.get("input", "")
+            assistant_text = row.get("output", "")
+            read_prompt = self.tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": assistant_text},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+                chat_template=chat_template,
+            )
+            all_probe_data.append({
+                "read_prompt": read_prompt,
+                "dialog": _BASE_DIALOG + [
+                    {"role": "user", "content": question_text},
+                    {"role": "assistant", "content": answer_text},
+                ],
+            })
 
-        # Step 2: Set up LoRA on target model
+        # Set up LoRA on target model
         layers_to_optimize = list(self.layers_to_optimize)
         lora_config = LoraConfig(
             r=self.lora_r,
@@ -623,72 +568,51 @@ class LatentQASteering(BaseModel):
             num_layers_to_read=self.num_layers_to_read,
         )
 
-        # Step 3: Optimize LoRA to match QA pairs
         optimizer = torch.optim.Adam(steered_model.parameters(), lr=self.steering_lr)
 
-        # Build training data from QA pairs + random prompts
-        from datasets import load_dataset
-        raw_data = load_dataset("databricks/databricks-dolly-15k")["train"]
-        prompts = []
-        for item in raw_data:
-            if len(item["instruction"].split()) > 100:
-                continue
-            if item["context"] == "":
-                prompts.append(item["instruction"])
-            elif len(item["context"].split()) < 200:
-                prompts.append(item["instruction"] + "\n\n" + item["context"])
-            if len(prompts) >= self.steering_samples:
-                break
-
-        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        # Left padding for LatentQA
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
 
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
 
-        for step_i, prompt_text in enumerate(tqdm(prompts, desc="LatentQA Steering")):
-            qa_idx = step_i % len(qa_pairs)
-            q, a = qa_pairs[qa_idx]
+        num_steps_per_epoch = max(1, len(all_probe_data) // batch_size)
+        for epoch in range(n_epochs):
+            progress_bar = tqdm(range(0, len(all_probe_data), batch_size),
+                                desc=f"LatentQA Steering epoch {epoch+1}/{n_epochs}")
+            for i in progress_bar:
+                probe_batch = all_probe_data[i:i + batch_size]
 
-            read_prompt = self.tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt_text}],
-                tokenize=False,
-                add_generation_prompt=True,
-                chat_template=chat_template,
-            )
+                batch = _lqa_tokenize(
+                    probe_batch,
+                    self.tokenizer,
+                    name=self.target_model_name,
+                    generate=False,
+                    mask_all_but_last=True,
+                    modify_chat_template=self.modify_chat_template,
+                )
 
-            formatted_data = [{
-                "read_prompt": read_prompt,
-                "dialog": _BASE_DIALOG + [
-                    {"role": "user", "content": q},
-                    {"role": "assistant", "content": a},
-                ],
-            }]
+                out = _latent_qa(
+                    batch,
+                    steered_model,
+                    self.decoder_model,
+                    module_read[0],
+                    module_write[0],
+                    self.tokenizer,
+                    shift_position_ids=True,
+                    generate=False,
+                    cache_target_model_grad=True,
+                )
 
-            batch = _lqa_tokenize(
-                formatted_data,
-                self.tokenizer,
-                name=self.target_model_name,
-                generate=False,
-                mask_all_but_last=True,
-                modify_chat_template=self.modify_chat_template,
-            )
+                loss = out["loss"]
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                progress_bar.set_description(
+                    f"LatentQA Steering epoch {epoch+1}/{n_epochs} || loss {loss.item():.4f}")
 
-            out = _latent_qa(
-                batch,
-                steered_model,
-                self.decoder_model,
-                module_read[0],
-                module_write[0],
-                self.tokenizer,
-                shift_position_ids=True,
-                generate=False,
-                cache_target_model_grad=True,
-            )
-
-            loss = out["loss"]
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+        self.tokenizer.padding_side = orig_padding_side
 
         # Save LoRA weights
         lora_path = os.path.join(dump_dir, f"latentqa_lora_concept_{concept_id}")
