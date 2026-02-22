@@ -30,6 +30,6 @@ torchrun --nproc_per_node=1 --master_port=29502 axbench/scripts/inference.py \
     --config "$CONFIG" \
     --dump_dir "$DUMP_DIR" \
     --mode steering \
-    --max_concepts 1
+    --max_concepts 500
 
 echo "Inference complete."
