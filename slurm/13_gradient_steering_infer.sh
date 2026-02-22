@@ -13,7 +13,7 @@ set -e
 
 cd /home/aryaman/axbench
 source .venv/bin/activate
-export PYTHONPATH="/home/aryaman/axbench/latentqa:$PYTHONPATH"
+
 export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
 
 DUMP_DIR=results/latentqa_gradient_steering

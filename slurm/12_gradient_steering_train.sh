@@ -13,7 +13,6 @@ set -e
 
 cd /home/aryaman/axbench
 source .venv/bin/activate
-export PYTHONPATH="/home/aryaman/axbench/latentqa:$PYTHONPATH"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-sk-dummy}"
 export CUDA_LAUNCH_BLOCKING=1
 

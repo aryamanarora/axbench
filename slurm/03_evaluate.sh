@@ -13,7 +13,7 @@ set -e
 
 cd /home/aryaman/axbench
 source .venv/bin/activate
-export PYTHONPATH="/home/aryaman/axbench/latentqa:$PYTHONPATH"
+
 
 DUMP_DIR=results/latentqa_detection
 CONFIG=axbench/sweep/aryaman/latentqa/reading_llama3_8b.yaml

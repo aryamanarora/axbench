@@ -23,13 +23,19 @@ if [ ! -f "$CONCEPT_JSON" ]; then
     wget -P axbench/data https://neuronpedia-exports.s3.amazonaws.com/explanations-only/gemma-2-2b_20-gemmascope-res-16k.json
 fi
 
-# Setup LatentQA
-if [ ! -d "./latentqa" ]; then
+# Setup LatentQA (cloned into axbench/models/_latentqa, auto-discovered via sys.path)
+if [ ! -d "axbench/models/_latentqa" ]; then
     echo "Cloning LatentQA..."
-    git clone https://github.com/aypan17/latentqa.git ./latentqa
+    git clone https://github.com/aypan17/latentqa.git axbench/models/_latentqa
 fi
-export PYTHONPATH="/home/aryaman/axbench/latentqa:$PYTHONPATH"
-python -c "from lit.utils.activation_utils import latent_qa; print('LatentQA import OK')"
+python -c "from axbench.models.latentqa import LatentQAReading; print('LatentQA import OK')"
+
+# Setup Activation Oracles (cloned into axbench/models/_activation_oracles, auto-discovered via sys.path)
+if [ ! -d "axbench/models/_activation_oracles" ]; then
+    echo "Cloning Activation Oracles..."
+    git clone https://github.com/adamkarvonen/activation_oracles.git axbench/models/_activation_oracles
+fi
+python -c "from axbench.models.activation_oracle import ActivationOracleReading; print('Activation Oracle import OK')"
 
 # Download seed sentences/instructions if missing
 if [ ! -d "axbench/data/seed_sentences" ] || [ ! -d "axbench/data/seed_instructions" ]; then
