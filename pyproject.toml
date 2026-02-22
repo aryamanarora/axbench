@@ -26,9 +26,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-latentqa = [
-    "latentqa @ git+https://github.com/aypan17/latentqa.git",
-]
+# latentqa: not pip-installable, clone and add to PYTHONPATH:
+#   git clone https://github.com/aypan17/latentqa.git
+#   export PYTHONPATH="/path/to/latentqa:$PYTHONPATH"
 activation_oracles = [
     "nl_probes @ git+https://github.com/adamkarvonen/activation_oracles.git",
 ]
