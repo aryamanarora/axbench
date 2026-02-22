@@ -26,11 +26,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# latentqa: not pip-installable. Clone into axbench/models/:
+# latentqa and activation_oracles have pinned deps that conflict with axbench.
+# Clone into axbench/models/ instead — they are auto-discovered on sys.path:
 #   cd axbench/models && git clone https://github.com/aypan17/latentqa.git
-activation_oracles = [
-    "nl_probes @ git+https://github.com/adamkarvonen/activation_oracles.git",
-]
+#   cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git
 glp = [
     "glp @ git+https://github.com/g-luo/generative_latent_prior.git",
     "diffusers>=0.30",

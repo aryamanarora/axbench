@@ -12,7 +12,9 @@ Requires the activation_oracles repo:
   pip install activation_oracles
   Or: pip install 'axbench[activation_oracles]'
 """
+import os
 import re
+import sys
 
 import torch
 from tqdm.auto import tqdm
@@ -29,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 
 # ── Optional dependency: activation_oracles (nl_probes) ──────────────────────
+# Add local clone to sys.path if present: axbench/models/activation_oracles/
+_ao_local = os.path.join(os.path.dirname(__file__), "activation_oracles")
+if os.path.isdir(_ao_local) and _ao_local not in sys.path:
+    sys.path.insert(0, _ao_local)
+
 try:
     from nl_probes.utils.activation_utils import collect_activations, get_hf_submodule
     from nl_probes.utils.steering_hooks import get_hf_activation_steering_hook, add_hook
@@ -44,9 +51,9 @@ except ImportError:
 def _require_ao():
     if not _HAS_AO:
         raise ImportError(
-            "activation_oracles is not installed. Install with:\n"
-            "  pip install activation_oracles\n"
-            "Or: pip install 'axbench[activation_oracles]'"
+            "activation_oracles is not installed. Clone into axbench/models/:\n"
+            "  cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git\n"
+            "Or add the repo to PYTHONPATH."
         )
 
 
