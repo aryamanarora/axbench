@@ -40,7 +40,7 @@ CONFIG_FILE = "config.json"
 METADATA_FILE = "metadata.jsonl"
 STEERING_WITH_SHARED_MODELS = {"HyperSteer"}
 STEERING_EXCLUDE_MODELS = {"IntegratedGradients", "InputXGradients", "PromptDetection", "BoW", "LatentQAReading", "ActivationOracleReading"}
-LATENT_EXCLUDE_MODELS = {"PromptSteering", "PromptBaseline", "DiReFT", "LoReFT", "LoRA", "SFT", "HyperSteer", "LatentQASteering", "LatentQAGradientSteering"}
+LATENT_EXCLUDE_MODELS = {"PromptSteering", "PromptBaseline", "DiReFT", "LoReFT", "LoRA", "SFT", "HyperSteer", "LatentQASteering", "LatentQAGradientSteering", "LatentQAActivationSteering"}
 LATENT_PROMPT_PREFIX = "Generate a random sentence."
 
 def load_config(config_path):
@@ -409,6 +409,7 @@ def infer_steering(args, rank, world_size, device, logger, training_args, genera
                     training_args=training_args.models[model_name] if model_name not in {"PromptSteering", "GemmaScopeSAE"} else None, # we init with training args as well
                     low_rank_dimension=len(metadata),
                     device=device, steering_layers=steering_layers,
+                    metadata=metadata,
                 )
                 if model_name in {"PromptSteering", "GemmaScopeSAE"}:
                     lr = 1

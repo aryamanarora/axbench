@@ -1,11 +1,13 @@
 """
 LatentQA integration for AxBench.
 
-Implements three model classes:
+Implements four model classes:
 - LatentQAReading: Uses LatentQA's reading mode for concept detection (latent inference).
 - LatentQASteering: Uses LatentQA's control mode (LoRA) for steering (steering inference).
 - LatentQAGradientSteering: Uses decoder-loss gradients on target activations as
   steering vectors. Cheaper than LoRA — no per-concept training, just one forward+backward.
+- LatentQAActivationSteering: Directly optimizes activations per-instance via gradient
+  descent on the decoder loss at inference time. Stronger than gradient vectors.
 
 Requires the LatentQA repo (https://github.com/aypan17/latentqa) to be installed.
 """
@@ -1071,3 +1073,314 @@ class LatentQAGradientSteering(BaseModel):
         # Store in self.ax.proj.weight for standard save/load
         self.ax.proj.weight.data = steering_vector.unsqueeze(0).to(self.device)
         self.ax.proj.bias.data = torch.zeros(1).to(self.device)
+
+
+class LatentQAActivationSteering(BaseModel):
+    """Direct activation optimization at inference time using LatentQA decoder loss.
+
+    Instead of computing a reusable steering vector, this optimizes activations
+    per-instance via gradient descent on the decoder loss. Produces much stronger
+    steering than gradient vectors but is not reusable across examples.
+
+    Flow (per example in predict_steer):
+    1. Run target model on input → capture activations at read layer
+    2. Clone activations as optimizable parameter
+    3. For num_steps iterations: inject optimized activations → decoder loss → update
+    4. Inject final optimized activations and generate
+    """
+
+    def __init__(self, model, tokenizer, layer=15, training_args=None, **kwargs):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.layer = layer
+        self.training_args = training_args
+        self.max_activations = {}
+        self.device = kwargs.get("device", "cuda:0")
+        self.decoder_device = kwargs.get("decoder_device", "cuda:1")
+        self.seed = kwargs.get("seed", 42)
+
+        # LatentQA-specific config
+        self.decoder_model_name = kwargs.get(
+            "decoder_model_name", "aypan17/latentqa_llama-3-8b-instruct")
+        self.target_model_name = kwargs.get(
+            "target_model_name", "meta-llama/Meta-Llama-3-8B-Instruct")
+        self.min_layer_to_read = kwargs.get("min_layer_to_read", 15)
+        self.max_layer_to_read = kwargs.get("max_layer_to_read", 16)
+        self.num_layers_to_read = kwargs.get("num_layers_to_read", 1)
+        self.layer_to_write = kwargs.get("layer_to_write", 0)
+        self.modify_chat_template = kwargs.get("modify_chat_template", True)
+
+        # Optimization config
+        self.num_steps = kwargs.get("num_steps", 20)
+        self.step_size = kwargs.get("step_size", 0.5)
+
+        # Metadata for concept lookup
+        self.metadata = kwargs.get("metadata", None)
+
+        self.decoder_model = None
+
+    def __str__(self):
+        return 'LatentQAActivationSteering'
+
+    def make_model(self, **kwargs):
+        pass
+
+    def save(self, dump_dir, **kwargs):
+        pass  # nothing to persist
+
+    def train(self, examples, **kwargs):
+        pass  # all work happens at inference time
+
+    def load(self, dump_dir=None, **kwargs):
+        """Load the decoder model (no steering vectors to load)."""
+        self._load_decoder()
+
+    def _load_decoder(self):
+        """Load the LatentQA decoder model if not already loaded."""
+        if self.decoder_model is not None:
+            return
+        self.decoder_model = _load_decoder_model(
+            self.target_model_name, self.decoder_model_name, self.decoder_device)
+        target_vocab_size = self.model.get_input_embeddings().weight.shape[0]
+        decoder_vocab_size = self.decoder_model.get_input_embeddings().weight.shape[0]
+        if target_vocab_size != decoder_vocab_size:
+            logger.warning(
+                f"Resizing decoder embeddings from {decoder_vocab_size} to {target_vocab_size}")
+            self.decoder_model.resize_token_embeddings(target_vocab_size)
+
+    def _optimize_activations(self, input_text, concept, factor):
+        """Optimize activations for a single example via decoder loss gradient descent.
+
+        Returns the activation delta (optimized - original) scaled by factor.
+        """
+        _require_latentqa()
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+
+        module_read, module_write = _get_modules(
+            self.model, self.decoder_model,
+            min_layer=self.min_layer_to_read,
+            max_layer=self.max_layer_to_read,
+            layer_to_write=self.layer_to_write,
+            num_layers_to_read=self.num_layers_to_read,
+        )
+
+        question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING.format(concept=concept)
+        answer_text = "Rating: [[2]]"
+
+        # Step 1: Run target model to capture original activations
+        read_prompt = input_text  # already tokenizer-formatted by inference pipeline
+
+        probe_data = [{
+            "read_prompt": read_prompt,
+            "dialog": _BASE_DIALOG + [
+                {"role": "user", "content": question_text},
+                {"role": "assistant", "content": answer_text},
+            ],
+        }]
+
+        orig_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+
+        batch = _lqa_tokenize(
+            probe_data,
+            self.tokenizer,
+            name=self.target_model_name,
+            generate=False,
+            mask_type=None,
+            mask_all_but_last=True,
+            modify_chat_template=self.modify_chat_template,
+        )
+
+        # Capture original activations via hook
+        original_acts = []
+
+        def capture_hook(module, input, output):
+            out_tensor = output[0] if isinstance(output, tuple) else output
+            original_acts.append(out_tensor.detach().clone())
+
+        hook_handle = module_read[0][0].register_forward_hook(capture_hook)
+
+        with torch.no_grad():
+            _latent_qa(
+                batch,
+                self.model,
+                self.decoder_model,
+                module_read[0],
+                module_write[0],
+                self.tokenizer,
+                shift_position_ids=True,
+                generate=False,
+                no_grad=True,
+            )
+
+        hook_handle.remove()
+
+        if not original_acts:
+            logger.error("Failed to capture original activations")
+            self.tokenizer.padding_side = orig_padding_side
+            return None
+
+        # Step 2: Clone as optimizable parameter
+        opt_acts = original_acts[0].clone().detach().requires_grad_(True)
+
+        # Step 3: Iterative optimization
+        for step in range(self.num_steps):
+            # Re-tokenize each step (batch object is reused)
+            batch = _lqa_tokenize(
+                probe_data,
+                self.tokenizer,
+                name=self.target_model_name,
+                generate=False,
+                mask_type=None,
+                mask_all_but_last=True,
+                modify_chat_template=self.modify_chat_template,
+            )
+
+            # Hook to inject optimized activations
+            def inject_hook(module, input, output, acts=opt_acts):
+                out = output[0] if isinstance(output, tuple) else output
+                # Replace with optimized activations (matching shape)
+                new_out = acts.to(out.device)
+                if isinstance(output, tuple):
+                    return (new_out,) + output[1:]
+                return new_out
+
+            hook_handle = module_read[0][0].register_forward_hook(inject_hook)
+
+            out = _latent_qa(
+                batch,
+                self.model,
+                self.decoder_model,
+                module_read[0],
+                module_write[0],
+                self.tokenizer,
+                shift_position_ids=True,
+                generate=False,
+                cache_target_model_grad=True,
+                no_grad=False,
+            )
+
+            hook_handle.remove()
+
+            loss = out.loss
+            loss.backward()
+
+            if opt_acts.grad is not None:
+                with torch.no_grad():
+                    opt_acts = (opt_acts - self.step_size * opt_acts.grad).detach().requires_grad_(True)
+
+                if step < 3 or step == self.num_steps - 1:
+                    logger.warning(
+                        f"  step {step}: loss={loss.item():.4f} "
+                        f"delta_norm={(opt_acts - original_acts[0]).norm():.4f}")
+            else:
+                logger.warning(f"  step {step}: no gradient on opt_acts")
+
+            self.model.zero_grad()
+            self.decoder_model.zero_grad()
+
+        self.tokenizer.padding_side = orig_padding_side
+
+        # Compute delta scaled by factor
+        delta = (opt_acts - original_acts[0]).detach()
+        return delta * factor
+
+    def predict_steer(self, examples, **kwargs):
+        """Generate steered text by optimizing activations per-example."""
+        _require_latentqa()
+        self.model.eval()
+        self.decoder_model.eval()
+        self.tokenizer.padding_side = "left"
+
+        eval_output_length = kwargs.get("eval_output_length", 128)
+        temperature = kwargs.get("temperature", 1.0)
+
+        all_generations = []
+        all_strengths = []
+
+        # Get concept name from metadata
+        concept_ids = examples["concept_id"].unique()
+        concept_id = concept_ids[0] if len(concept_ids) == 1 else kwargs.get("concept_id", 0)
+        if self.metadata is not None and concept_id < len(self.metadata):
+            concept = self.metadata[concept_id]["concept"]
+        else:
+            concept = ""
+            logger.warning("No metadata available, using empty concept name")
+
+        module_read, _ = _get_modules(
+            self.model, self.decoder_model,
+            min_layer=self.min_layer_to_read,
+            max_layer=self.max_layer_to_read,
+            layer_to_write=self.layer_to_write,
+            num_layers_to_read=self.num_layers_to_read,
+        )
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        progress_bar = tqdm(range(len(examples)), position=rank, leave=True,
+                           desc="LatentQA Activation Steering")
+
+        for idx in range(len(examples)):
+            row = examples.iloc[idx]
+            input_text = row["input"]
+            factor = row["factor"]
+
+            logger.warning(
+                f"Optimizing activations for example {idx+1}/{len(examples)} "
+                f"(concept={concept!r}, factor={factor})")
+
+            # Optimize activations
+            delta = self._optimize_activations(input_text, concept, factor)
+
+            # Generate with optimized activations injected
+            def generation_hook(module, input, output, _delta=delta):
+                if _delta is None:
+                    return output
+                out_tensor = output[0] if isinstance(output, tuple) else output
+                # Delta has shape from the probe pass; for generation we add to
+                # all positions (or last token if shapes differ)
+                if _delta.shape[1] <= out_tensor.shape[1]:
+                    out_tensor = out_tensor.clone()
+                    out_tensor[:, :_delta.shape[1], :] += _delta.to(out_tensor.device, out_tensor.dtype)
+                else:
+                    out_tensor = out_tensor.clone()
+                    out_tensor += _delta[:, :out_tensor.shape[1], :].to(out_tensor.device, out_tensor.dtype)
+                if isinstance(output, tuple):
+                    return (out_tensor,) + output[1:]
+                return out_tensor
+
+            hook_handle = module_read[0][0].register_forward_hook(generation_hook)
+
+            inputs = self.tokenizer(
+                input_text, return_tensors="pt", padding=True, truncation=True
+            ).to(self.device)
+
+            with torch.no_grad():
+                generations = self.model.generate(
+                    **inputs,
+                    max_new_tokens=eval_output_length,
+                    do_sample=True,
+                    temperature=temperature,
+                )
+
+            hook_handle.remove()
+
+            input_length = len(inputs.input_ids[0])
+            generated_text = self.tokenizer.decode(
+                generations[0][input_length:], skip_special_tokens=True)
+            all_generations.append(generated_text)
+            all_strengths.append(factor)
+
+            progress_bar.update(1)
+            torch.cuda.empty_cache()
+
+        return {
+            "steered_generation": all_generations,
+            "strength": all_strengths,
+        }
+
+    def pre_compute_mean_activations(self, dump_dir, **kwargs):
+        return {}
+
+    def to(self, device):
+        self.device = device
+        return self
