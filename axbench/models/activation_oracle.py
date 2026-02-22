@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 # ── Optional dependency: activation_oracles (nl_probes) ──────────────────────
-# Add local clone to sys.path if present: axbench/models/activation_oracles/
-_ao_local = os.path.join(os.path.dirname(__file__), "activation_oracles")
+# Add local clone to sys.path if present: axbench/models/_activation_oracles/
+_ao_local = os.path.join(os.path.dirname(__file__), "_activation_oracles")
 if os.path.isdir(_ao_local) and _ao_local not in sys.path:
     sys.path.insert(0, _ao_local)
 
@@ -52,7 +52,7 @@ def _require_ao():
     if not _HAS_AO:
         raise ImportError(
             "activation_oracles is not installed. Clone into axbench/models/:\n"
-            "  cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git\n"
+            "  cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git _activation_oracles\n"
             "Or add the repo to PYTHONPATH."
         )
 

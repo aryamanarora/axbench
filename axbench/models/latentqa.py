@@ -43,8 +43,8 @@ CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING = (
 )
 
 
-# Add local clone to sys.path if present: axbench/models/latentqa/
-_latentqa_local = os.path.join(os.path.dirname(__file__), "latentqa")
+# Add local clone to sys.path if present: axbench/models/_latentqa/
+_latentqa_local = os.path.join(os.path.dirname(__file__), "_latentqa")
 if os.path.isdir(_latentqa_local) and _latentqa_local not in sys.path:
     sys.path.insert(0, _latentqa_local)
 
@@ -65,7 +65,7 @@ def _require_latentqa():
     if not _HAS_LATENTQA:
         raise ImportError(
             "LatentQA is not installed. Clone into axbench/models/:\n"
-            "  cd axbench/models && git clone https://github.com/aypan17/latentqa.git\n"
+            "  cd axbench/models && git clone https://github.com/aypan17/latentqa.git _latentqa\n"
             "Or add the repo to PYTHONPATH."
         )
 

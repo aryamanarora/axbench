@@ -28,8 +28,8 @@ dependencies = [
 [project.optional-dependencies]
 # latentqa and activation_oracles have pinned deps that conflict with axbench.
 # Clone into axbench/models/ instead — they are auto-discovered on sys.path:
-#   cd axbench/models && git clone https://github.com/aypan17/latentqa.git
-#   cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git
+#   cd axbench/models && git clone https://github.com/aypan17/latentqa.git _latentqa
+#   cd axbench/models && git clone https://github.com/adamkarvonen/activation_oracles.git _activation_oracles
 glp = [
     "glp @ git+https://github.com/g-luo/generative_latent_prior.git",
     "diffusers>=0.30",
