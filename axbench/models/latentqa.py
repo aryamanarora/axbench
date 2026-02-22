@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from transformers import AutoModelForCausalLM
 from .model import Model, BaseModel
 
 import logging
@@ -51,7 +52,7 @@ if os.path.isdir(_latentqa_local) and _latentqa_local not in sys.path:
 try:
     from lit.utils.activation_utils import latent_qa as _latent_qa
     from lit.utils.dataset_utils import BASE_DIALOG as _BASE_DIALOG, ENCODER_CHAT_TEMPLATES as _ENCODER_CHAT_TEMPLATES
-    from lit.utils.infra_utils import get_model as _lqa_get_model, get_tokenizer as _lqa_get_tokenizer
+    from lit.utils.infra_utils import get_tokenizer as _lqa_get_tokenizer
     try:
         from lit.utils.dataset_utils import lqa_tokenize as _lqa_tokenize
     except ImportError:
@@ -90,17 +91,32 @@ def _get_model_layers_str(model):
 
 
 def _load_decoder_model(target_model_name, decoder_model_name, decoder_device):
-    """Load the LatentQA decoder model (shared across model classes)."""
+    """Load the LatentQA decoder model (shared across model classes).
+
+    Replicates the essential steps of latentqa's ``get_model`` but uses
+    ``sdpa`` attention so we don't depend on ``flash-attn``.
+    """
     _require_latentqa()
+    from peft import PeftModel
 
     logger.warning(f"Loading LatentQA decoder from {decoder_model_name} to {decoder_device}")
     lqa_tokenizer = _lqa_get_tokenizer(target_model_name)
-    decoder_model = _lqa_get_model(
-        model_name=target_model_name,
-        tokenizer=lqa_tokenizer,
-        load_peft_checkpoint=decoder_model_name,
-        device=decoder_device,
+
+    # Load base model with sdpa (no flash-attn dependency)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        target_model_name,
+        attn_implementation="sdpa",
+        torch_dtype=torch.bfloat16,
+        device_map="auto" if decoder_device == "auto" else None,
     )
+    base_model.resize_token_embeddings(len(lqa_tokenizer))
+    for p in base_model.parameters():
+        p.requires_grad = False
+
+    # Load LoRA decoder weights
+    decoder_model = PeftModel.from_pretrained(base_model, decoder_model_name)
+    if decoder_device is not None and decoder_device != "auto":
+        decoder_model = decoder_model.to(decoder_device)
     decoder_model.eval()
     return decoder_model
 
