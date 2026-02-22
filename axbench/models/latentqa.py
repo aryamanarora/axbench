@@ -8,7 +8,6 @@ Implements three model classes:
   steering vectors. Cheaper than LoRA — no per-concept training, just one forward+backward.
 
 Requires the LatentQA repo (https://github.com/aypan17/latentqa) to be installed.
-Install with: pip install -e /path/to/latentqa
 """
 import json
 import os
@@ -18,7 +17,6 @@ import re
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-from dataclasses import dataclass
 
 from .model import Model, BaseModel
 
@@ -45,28 +43,26 @@ CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING = (
 )
 
 
-def _ensure_latentqa_imported():
-    """Ensure the LatentQA library is importable."""
+try:
+    from lit.utils.activation_utils import latent_qa as _latent_qa
+    from lit.utils.dataset_utils import BASE_DIALOG as _BASE_DIALOG, ENCODER_CHAT_TEMPLATES as _ENCODER_CHAT_TEMPLATES
+    from lit.utils.infra_utils import get_model as _lqa_get_model, get_tokenizer as _lqa_get_tokenizer
     try:
-        from lit.utils.activation_utils import latent_qa
-        return True
+        from lit.utils.dataset_utils import lqa_tokenize as _lqa_tokenize
     except ImportError:
+        from lit.utils.dataset_utils import tokenize as _lqa_tokenize
+    _HAS_LATENTQA = True
+except ImportError:
+    _HAS_LATENTQA = False
+
+
+def _require_latentqa():
+    if not _HAS_LATENTQA:
         raise ImportError(
-            "LatentQA is not installed. Please install it:\n"
-            "  git clone https://github.com/aypan17/latentqa.git\n"
-            "  pip install -e latentqa/\n"
-            "Or add its path to PYTHONPATH."
+            "LatentQA is not installed. Install with:\n"
+            "  pip install latentqa\n"
+            "Or: pip install 'axbench[latentqa]'"
         )
-
-
-def _get_tokenize_fn():
-    """Get the tokenize function from LatentQA, handling naming differences."""
-    try:
-        from lit.utils.dataset_utils import lqa_tokenize
-        return lqa_tokenize
-    except ImportError:
-        from lit.utils.dataset_utils import tokenize
-        return tokenize
 
 
 def _get_model_layers_str(model):
@@ -90,12 +86,11 @@ def _get_model_layers_str(model):
 
 def _load_decoder_model(target_model_name, decoder_model_name, decoder_device):
     """Load the LatentQA decoder model (shared across model classes)."""
-    _ensure_latentqa_imported()
-    from lit.utils.infra_utils import get_model as lqa_get_model, get_tokenizer as lqa_get_tokenizer
+    _require_latentqa()
 
     logger.warning(f"Loading LatentQA decoder from {decoder_model_name} to {decoder_device}")
-    lqa_tokenizer = lqa_get_tokenizer(target_model_name)
-    decoder_model = lqa_get_model(
+    lqa_tokenizer = _lqa_get_tokenizer(target_model_name)
+    decoder_model = _lqa_get_model(
         model_name=target_model_name,
         tokenizer=lqa_tokenizer,
         load_peft_checkpoint=decoder_model_name,
@@ -211,11 +206,7 @@ class LatentQAReading(BaseModel):
         feeds them to the LatentQA decoder with a yes/no concept question,
         and uses P(Yes) - P(No) logit difference as the detection score.
         """
-        _ensure_latentqa_imported()
-        from lit.utils.activation_utils import latent_qa
-        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
-
-        tokenize_fn = _get_tokenize_fn()
+        _require_latentqa()
 
         self.model.eval()
         self.decoder_model.eval()
@@ -228,7 +219,7 @@ class LatentQAReading(BaseModel):
         no_token_id = self.tokenizer.encode("No", add_special_tokens=False)[0]
 
         question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE.format(concept=concept)
-        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         all_max_act = []
 
@@ -252,7 +243,7 @@ class LatentQAReading(BaseModel):
                     add_generation_prompt=False,
                     chat_template=chat_template,
                 )
-                dialog = BASE_DIALOG + [
+                dialog = _BASE_DIALOG + [
                     {"role": "user", "content": question_text},
                 ]
                 probe_data.append({
@@ -262,7 +253,7 @@ class LatentQAReading(BaseModel):
 
             # Tokenize with generate=True to include the assistant header,
             # then do a forward pass to get logits (not model.generate).
-            batch_tokenized = tokenize_fn(
+            batch_tokenized = _lqa_tokenize(
                 probe_data,
                 self.tokenizer,
                 name=self.target_model_name,
@@ -277,7 +268,7 @@ class LatentQAReading(BaseModel):
             batch_tokenized["tokenized_write"]["labels"] = input_ids.clone()
 
             # Forward pass to get logits
-            out = latent_qa(
+            out = _latent_qa(
                 batch_tokenized,
                 self.model,
                 self.decoder_model,
@@ -352,11 +343,7 @@ class LatentQAReadingRating(LatentQAReading):
             return -1
 
     def predict_latent(self, examples, **kwargs):
-        _ensure_latentqa_imported()
-        from lit.utils.activation_utils import latent_qa
-        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
-
-        tokenize_fn = _get_tokenize_fn()
+        _require_latentqa()
 
         self.model.eval()
         self.decoder_model.eval()
@@ -365,7 +352,7 @@ class LatentQAReadingRating(LatentQAReading):
         batch_size = kwargs.get("batch_size", 4)
 
         question_text = CONCEPT_DETECTION_QUESTION_TEMPLATE_RATING.format(concept=concept)
-        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         all_max_act = []
 
@@ -388,7 +375,7 @@ class LatentQAReadingRating(LatentQAReading):
                     add_generation_prompt=False,
                     chat_template=chat_template,
                 )
-                dialog = BASE_DIALOG + [
+                dialog = _BASE_DIALOG + [
                     {"role": "user", "content": question_text},
                 ]
                 probe_data.append({
@@ -396,14 +383,14 @@ class LatentQAReadingRating(LatentQAReading):
                     "dialog": dialog,
                 })
 
-            batch_tokenized = tokenize_fn(
+            batch_tokenized = _lqa_tokenize(
                 probe_data, self.tokenizer, name=self.target_model_name,
                 generate=True, mask_type=None, mask_all_but_last=True,
                 modify_chat_template=self.modify_chat_template,
             )
 
             with torch.no_grad():
-                out = latent_qa(
+                out = _latent_qa(
                     batch_tokenized, self.model, self.decoder_model,
                     self.module_read[0], self.module_write[0], self.tokenizer,
                     shift_position_ids=False, generate=True,
@@ -497,12 +484,8 @@ class LatentQASteering(BaseModel):
         Creates a prompt embodying the concept, runs the target model on it,
         and uses the decoder to generate descriptions of the activations.
         """
-        _ensure_latentqa_imported()
-        from lit.utils.activation_utils import latent_qa
-        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
-
-        tokenize_fn = _get_tokenize_fn()
-        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        _require_latentqa()
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         # Questions to probe the concept
         questions = [
@@ -524,13 +507,13 @@ class LatentQASteering(BaseModel):
 
         probe_data = []
         for q in questions:
-            dialog = BASE_DIALOG + [{"role": "user", "content": q[0]}]
+            dialog = _BASE_DIALOG + [{"role": "user", "content": q[0]}]
             probe_data.append({
                 "read_prompt": read_prompt,
                 "dialog": dialog,
             })
 
-        batch = tokenize_fn(
+        batch = _lqa_tokenize(
             probe_data,
             self.tokenizer,
             name=self.target_model_name,
@@ -548,7 +531,7 @@ class LatentQASteering(BaseModel):
             num_layers_to_read=self.num_layers_to_read,
         )
 
-        out = latent_qa(
+        out = _latent_qa(
             batch,
             self.model,
             self.decoder_model,
@@ -576,12 +559,8 @@ class LatentQASteering(BaseModel):
         For each concept, generates QA descriptions via reading mode,
         then trains a LoRA adapter to match those descriptions.
         """
-        from lit.utils.activation_utils import latent_qa
-        from lit.utils.dataset_utils import BASE_DIALOG
+        _require_latentqa()
         from peft import LoraConfig, get_peft_model
-        from dataclasses import fields
-
-        tokenize_fn = _get_tokenize_fn()
 
         self._load_decoder()
         concept = kwargs.get("concept", "")
@@ -640,8 +619,7 @@ class LatentQASteering(BaseModel):
             if len(prompts) >= self.steering_samples:
                 break
 
-        from lit.utils.dataset_utils import ENCODER_CHAT_TEMPLATES
-        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
@@ -659,13 +637,13 @@ class LatentQASteering(BaseModel):
 
             formatted_data = [{
                 "read_prompt": read_prompt,
-                "dialog": BASE_DIALOG + [
+                "dialog": _BASE_DIALOG + [
                     {"role": "user", "content": q},
                     {"role": "assistant", "content": a},
                 ],
             }]
 
-            batch = tokenize_fn(
+            batch = _lqa_tokenize(
                 formatted_data,
                 self.tokenizer,
                 name=self.target_model_name,
@@ -674,7 +652,7 @@ class LatentQASteering(BaseModel):
                 modify_chat_template=self.modify_chat_template,
             )
 
-            out = latent_qa(
+            out = _latent_qa(
                 batch,
                 steered_model,
                 self.decoder_model,
@@ -1014,12 +992,8 @@ class LatentQAGradientSteering(BaseModel):
 
         Returns: steering vector of shape (hidden_dim,)
         """
-        _ensure_latentqa_imported()
-        from lit.utils.activation_utils import latent_qa
-        from lit.utils.dataset_utils import BASE_DIALOG, ENCODER_CHAT_TEMPLATES
-
-        tokenize_fn = _get_tokenize_fn()
-        chat_template = ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
+        _require_latentqa()
+        chat_template = _ENCODER_CHAT_TEMPLATES.get(self.tokenizer.name_or_path, None)
 
         module_read, module_write = _get_modules(
             self.model, self.decoder_model,
@@ -1049,7 +1023,7 @@ class LatentQAGradientSteering(BaseModel):
             )
             all_probe_data.append({
                 "read_prompt": read_prompt,
-                "dialog": BASE_DIALOG + [
+                "dialog": _BASE_DIALOG + [
                     {"role": "user", "content": question_text},
                     {"role": "assistant", "content": answer_text},
                 ],
@@ -1066,7 +1040,7 @@ class LatentQAGradientSteering(BaseModel):
         for i in range(0, len(all_probe_data), batch_size):
             probe_data = all_probe_data[i:i + batch_size]
 
-            batch = tokenize_fn(
+            batch = _lqa_tokenize(
                 probe_data,
                 self.tokenizer,
                 name=self.target_model_name,
@@ -1090,7 +1064,7 @@ class LatentQAGradientSteering(BaseModel):
                 for mod in module_read[0]
             ]
 
-            out = latent_qa(
+            out = _latent_qa(
                 batch,
                 self.model,
                 self.decoder_model,
