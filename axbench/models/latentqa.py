@@ -1046,11 +1046,7 @@ class LatentQAGradientSteering(BaseModel):
 
         # Average across mini-batches
         steering_vector = torch.stack(all_grads).mean(dim=0)
-
-        # Normalize to unit length for consistent scaling with factors
-        norm = steering_vector.norm()
-        if norm > 0:
-            steering_vector = steering_vector / norm
+        logger.warning(f"Steering vector norm: {steering_vector.norm():.4f}")
         return steering_vector
 
     def train(self, examples, **kwargs):
