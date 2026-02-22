@@ -37,6 +37,7 @@ axbench/demo/demo_aryaman.sh
 axbench/data/seed_sentences/
 axbench/data/seed_instructions/
 axbench/models/dbm.py
+axbench/models/latentqa/
 axbench/concept1
 axbench/concept3
 
