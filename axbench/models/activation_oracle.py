@@ -465,6 +465,25 @@ class ActivationOracleReadingRating(ActivationOracleReading):
         return {"max_act": all_max_act}
 
 
+def _make_rating_labels(input_ids, tokenizer):
+    """Build labels that only supervise the rating token after '[['.
+
+    Given "Rating: [[2]]", we want loss only on predicting "2" (the token
+    right after "[["). Everything else is masked with -100.
+    """
+    labels = torch.full_like(input_ids, -100)
+    bracket_ids = tokenizer.encode("[[", add_special_tokens=False)
+    for b in range(input_ids.shape[0]):
+        ids = input_ids[b].tolist()
+        for pos in range(len(ids) - len(bracket_ids)):
+            if ids[pos:pos+len(bracket_ids)] == bracket_ids:
+                target_pos = pos + len(bracket_ids) - 1  # last token of "[["
+                if target_pos + 1 < len(ids):
+                    labels[b, target_pos] = ids[target_pos + 1]  # predict "2"
+                break
+    return labels
+
+
 # ── Gradient-preserving steering hook ────────────────────────────────────────
 def _get_gradient_preserving_steering_hook(
     all_vectors, all_positions, steering_coefficient, device, dtype,
@@ -737,7 +756,7 @@ class ActivationOracleGradientSteering(BaseModel):
 
             hook_handle = injection_submodule.register_forward_hook(hook_fn)
 
-            labels = oracle_inputs.input_ids.clone()
+            labels = _make_rating_labels(oracle_inputs.input_ids, self.tokenizer)
             outputs = self.model(**oracle_inputs, labels=labels)
 
             hook_handle.remove()
@@ -1027,7 +1046,7 @@ class ActivationOracleActivationSteering(BaseModel):
 
             hook_handle = injection_submodule.register_forward_hook(hook_fn)
 
-            labels = oracle_inputs.input_ids.clone()
+            labels = _make_rating_labels(oracle_inputs.input_ids, self.tokenizer)
             outputs = self.model(**oracle_inputs, labels=labels)
 
             hook_handle.remove()
