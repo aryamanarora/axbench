@@ -466,21 +466,33 @@ class ActivationOracleReadingRating(ActivationOracleReading):
 
 
 def _make_rating_labels(input_ids, tokenizer):
-    """Build labels that only supervise the rating token after '[['.
+    """Build labels that supervise the full answer portion of the oracle prompt.
 
-    Given "Rating: [[2]]", we want loss only on predicting "2" (the token
-    right after "[["). Everything else is masked with -100.
+    The oracle prompt ends with an assistant turn containing "Rating: [[2]]".
+    We mask everything before the assistant answer start, matching how LatentQA's
+    mask_all_but_last works: loss on all answer tokens, not just the rating number.
+
+    We find the last assistant header token sequence and unmask everything after it.
     """
-    labels = torch.full_like(input_ids, -100)
-    bracket_ids = tokenizer.encode("[[", add_special_tokens=False)
+    labels = input_ids.clone()
+    # Find the answer start by tokenizing "Rating: [[2]]" and locating it
+    answer_ids = tokenizer.encode("Rating: [[2]]", add_special_tokens=False)
     for b in range(input_ids.shape[0]):
         ids = input_ids[b].tolist()
-        for pos in range(len(ids) - len(bracket_ids)):
-            if ids[pos:pos+len(bracket_ids)] == bracket_ids:
-                target_pos = pos + len(bracket_ids) - 1  # last token of "[["
-                if target_pos + 1 < len(ids):
-                    labels[b, target_pos] = ids[target_pos + 1]  # predict "2"
+        answer_start = None
+        # Search for the answer token sequence
+        for pos in range(len(ids) - len(answer_ids) + 1):
+            if ids[pos:pos+len(answer_ids)] == answer_ids:
+                answer_start = pos
                 break
+        if answer_start is not None:
+            # Mask everything before the answer; keep answer tokens as labels
+            # Labels are shifted internally by HF, so label[t] = input[t+1]
+            # We want loss on predicting answer tokens, so mask up to answer_start-1
+            labels[b, :answer_start - 1] = -100
+        else:
+            # Fallback: mask everything
+            labels[b, :] = -100
     return labels
 
 
