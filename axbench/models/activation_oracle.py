@@ -466,24 +466,27 @@ class ActivationOracleReadingRating(ActivationOracleReading):
 
 
 def _make_rating_labels(input_ids, tokenizer):
-    """Build labels that only supervise predicting the rating number after '[['.
+    """Build labels that only supervise predicting the rating digit "2".
 
-    Given "Rating: [[2]]", loss is only on the next-token prediction at the
-    last token of "[[" → predicting "2". Everything else is masked with -100.
+    The prompt ends with "Rating: [[2]]". We find the token for "2" by
+    searching backwards from the end of each sequence (skipping EOS/padding),
+    then set labels so the model is trained to predict that token.
+
+    HF's cross-entropy shifts internally: loss at position t uses labels[t]
+    to predict input_ids[t]. So we set labels[pos_of_2 - 1] = token_id_of_2.
     """
     labels = torch.full_like(input_ids, -100)
-    bracket_ids = tokenizer.encode("[[", add_special_tokens=False)
+    # Token id for "2" (the rating digit)
+    two_token_id = tokenizer.encode("2", add_special_tokens=False)[0]
+
     for b in range(input_ids.shape[0]):
         ids = input_ids[b].tolist()
-        for pos in range(len(ids) - len(bracket_ids)):
-            if ids[pos:pos+len(bracket_ids)] == bracket_ids:
-                # HF cross-entropy: labels[t] is the target for input[t],
-                # loss = CE(logits[t], labels[t]) where logits[t] predicts token t+1
-                # So to supervise predicting ids[pos+len(bracket_ids)],
-                # set labels[pos+len(bracket_ids)-1] = ids[pos+len(bracket_ids)]
-                target_pos = pos + len(bracket_ids) - 1
-                if target_pos + 1 < len(ids):
-                    labels[b, target_pos] = ids[target_pos + 1]
+        # Search backwards for the "2" token (skip trailing special/pad tokens)
+        for pos in range(len(ids) - 1, -1, -1):
+            if ids[pos] == two_token_id:
+                # Set label at pos-1 so model predicts "2" at position pos
+                if pos > 0:
+                    labels[b, pos - 1] = two_token_id
                 break
     return labels
 
