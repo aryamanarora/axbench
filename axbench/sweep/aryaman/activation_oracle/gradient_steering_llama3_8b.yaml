@@ -1,0 +1,92 @@
+# Activation Oracle Gradient-based Steering on Llama-3.1-8B-Instruct.
+#
+# Uses oracle-loss gradients on target activations as steering vectors.
+# The oracle is a LoRA adapter on the same model (not a separate decoder),
+# so gradients should be stronger than LatentQA's decoder-based approach.
+#
+# Prerequisites:
+#   1. Clone activation_oracles into axbench/models/_activation_oracles
+#   2. Oracle LoRA auto-downloaded from HF
+#   3. Requires 1 GPU (oracle shares the target model)
+#
+# Usage:
+#   # Data generation (reuse from reading run):
+#   torchrun --nproc_per_node=1 axbench/scripts/generate.py \
+#     --config axbench/sweep/aryaman/activation_oracle/gradient_steering_llama3_8b.yaml
+#
+#   # Training (compute gradient steering vectors):
+#   torchrun --nproc_per_node=1 axbench/scripts/train.py \
+#     --config axbench/sweep/aryaman/activation_oracle/gradient_steering_llama3_8b.yaml
+#
+#   # Inference (steering with gradient vectors):
+#   torchrun --nproc_per_node=1 axbench/scripts/inference.py \
+#     --config axbench/sweep/aryaman/activation_oracle/gradient_steering_llama3_8b.yaml --mode steering
+
+generate:
+  lm_model: "gpt-4o-mini"
+  output_length: 128
+  num_of_examples: 144
+  concept_path: "axbench/data/gemma-2-2b_20-gemmascope-res-16k.json"
+  max_concepts: 500
+  master_data_dir: "axbench/data"
+  dataset_category: "instruction"
+  lm_use_cache: false
+  seed: 42
+
+train:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  layer: 16  # 50% of 32 layers = extraction_layer
+  component: "res"
+  seed: 42
+  use_bf16: true
+  output_length: 128
+  models:
+    ActivationOracleGradientSteering:
+      batch_size: 1
+      n_epochs: 1
+      lr: 0.01
+      low_rank_dimension: 1
+      intervention_positions: "all"
+      intervention_type: "addition"
+      binarize_dataset: false
+      train_on_negative: true
+      exclude_bos: true
+
+inference:
+  use_bf16: true
+  models: ["ActivationOracleGradientSteering"]
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  # latent related params
+  output_length: 128
+  latent_num_of_examples: 36
+  latent_batch_size: 4
+  # steering related params
+  steering_intervention_type: "addition"
+  steering_model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  steering_datasets: ["AlpacaEval"]
+  steering_batch_size: 4
+  steering_output_length: 128
+  steering_layers: [16]
+  steering_num_of_examples: 10
+  steering_factors: [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 4.0, 5.0]
+  # master data dir
+  master_data_dir: "axbench/data"
+  seed: 42
+  lm_model: "gpt-4o-mini"
+  temperature: 1.0
+
+evaluate:
+  models: ["ActivationOracleGradientSteering"]
+  latent_evaluators: [
+    "AUCROCEvaluator",
+    "HardNegativeEvaluator",
+  ]
+  steering_evaluators: [
+    "LMJudgeEvaluator",
+  ]
+  winrate_split_ratio: 0.5
+  num_of_workers: 32
+  lm_model: "gpt-4o-mini"
+  run_winrate: false
+  winrate_baseline: "PromptSteering"
+  master_data_dir: "axbench/data"

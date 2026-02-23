@@ -40,7 +40,7 @@ CONFIG_FILE = "config.json"
 METADATA_FILE = "metadata.jsonl"
 STEERING_WITH_SHARED_MODELS = {"HyperSteer"}
 STEERING_EXCLUDE_MODELS = {"IntegratedGradients", "InputXGradients", "PromptDetection", "BoW", "LatentQAReading", "ActivationOracleReading"}
-LATENT_EXCLUDE_MODELS = {"PromptSteering", "PromptBaseline", "DiReFT", "LoReFT", "LoRA", "SFT", "HyperSteer", "LatentQASteering", "LatentQAGradientSteering", "LatentQAActivationSteering"}
+LATENT_EXCLUDE_MODELS = {"PromptSteering", "PromptBaseline", "DiReFT", "LoReFT", "LoRA", "SFT", "HyperSteer", "LatentQASteering", "LatentQAGradientSteering", "LatentQAActivationSteering", "ActivationOracleGradientSteering", "ActivationOracleActivationSteering"}
 LATENT_PROMPT_PREFIX = "Generate a random sentence."
 
 def load_config(config_path):
