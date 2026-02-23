@@ -469,10 +469,18 @@ class ActivationOracleReadingRating(ActivationOracleReading):
 def _get_gradient_preserving_steering_hook(
     all_vectors, all_positions, steering_coefficient, device, dtype,
 ):
-    """Like get_hf_activation_steering_hook but WITHOUT .detach() so gradients flow."""
+    """Like get_hf_activation_steering_hook but WITHOUT .detach() so gradients flow.
+
+    Builds an additive delta tensor (non-in-place) so autograd can track
+    through from the injected vectors back to their source.
+    """
     def hook_fn(module, input, output):
         out_tensor = output[0] if isinstance(output, tuple) else output
-        for b in range(out_tensor.shape[0]):
+        batch_size, seq_len, hidden_dim = out_tensor.shape
+        # Build a delta tensor that's zero everywhere except at injection positions
+        # This keeps the computation graph intact for gradient flow
+        delta = torch.zeros_like(out_tensor)
+        for b in range(batch_size):
             if b >= len(all_vectors) or b >= len(all_positions):
                 continue
             vecs = all_vectors[b].to(device=device, dtype=dtype)
@@ -480,11 +488,14 @@ def _get_gradient_preserving_steering_hook(
             n = min(len(positions), vecs.shape[0])
             for j in range(n):
                 pos = positions[j]
-                if pos < out_tensor.shape[1]:
-                    out_tensor[b, pos] = out_tensor[b, pos] + steering_coefficient * vecs[j]
+                if pos < seq_len:
+                    # Non-in-place: delta is zeros, so this scatter is safe
+                    # But we need vecs[j] in the graph, so use addition
+                    delta[b, pos] = delta[b, pos] + steering_coefficient * vecs[j]
+        new_out = out_tensor + delta
         if isinstance(output, tuple):
-            return (out_tensor,) + output[1:]
-        return out_tensor
+            return (new_out,) + output[1:]
+        return new_out
     return hook_fn
 
 
@@ -661,8 +672,12 @@ class ActivationOracleGradientSteering(BaseModel):
 
             extraction_submodule = get_hf_submodule(
                 self.model, self._extraction_layer, use_lora=use_lora)
-            activations = collect_activations(
-                self.model, extraction_submodule, target_inputs, use_no_grad=False)
+            with torch.no_grad():
+                activations = collect_activations(
+                    self.model, extraction_submodule, target_inputs)
+            # Detach and make a grad-tracking leaf so the hook's addition
+            # creates a gradient path: loss → hook output → activations.grad
+            activations = activations.detach().requires_grad_(True)
 
             self.model.enable_adapter_layers()
             self.model.set_adapter(self._oracle_adapter_name)
